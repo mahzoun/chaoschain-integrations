@@ -38,7 +38,7 @@ from rich.align import Align
 from rich.table import Table
 from chaoschain_sdk import ChaosChainAgentSDK, NetworkConfig
 from chaoschain_sdk.types import AgentRole, PaymentMethod, PaymentProof
-from chaoschain_sdk.exceptions import PaymentError
+from chaoschain_sdk.exceptions import PaymentError, ContractError
 from web3.exceptions import TimeExhausted
 
 # Import agents
@@ -1249,6 +1249,25 @@ class GenesisStudioX402Orchestrator:
             analysis_str = str(analysis_data)
             data_hash = "0x" + hashlib.sha256(analysis_str.encode()).hexdigest()
         
+        offline_env = os.getenv("CHAOSCHAIN_OFFLINE_MODE", "0").lower() in ("1", "true", "yes")
+        alice_offline = bool(getattr(getattr(self.alice_sdk, "wallet_manager", None), "is_offline_mode", False))
+        bob_offline = bool(getattr(getattr(self.bob_sdk, "wallet_manager", None), "is_offline_mode", False))
+        request_hash_hex: Optional[str] = None
+        request_uri = ""
+        if offline_env or alice_offline or bob_offline:
+            rprint("[yellow]⚠️  CHAOSCHAIN_OFFLINE_MODE enabled – simulating ERC-8004 validation request.[/yellow]")
+            tx_hash = "offline_validation_skipped"
+            self.results["erc8004_validation_request"] = {
+                "success": False,
+                "simulated": True,
+                "data_hash": data_hash,
+                "validator_agent_id": self.bob_sdk.get_agent_id(),
+                "error": "offline_mode_enabled",
+                "request_hash": None,
+                "request_uri": None
+            }
+            return tx_hash
+        
         try:
             # Check if Bob is registered and has an agent ID
             bob_agent_id = self.bob_sdk.get_agent_id()
@@ -1260,11 +1279,43 @@ class GenesisStudioX402Orchestrator:
                 bob_agent_id = 2  # Assume Bob is agent ID 2
                 alice_agent_id = 1  # Assume Alice is agent ID 1
             
-            validator_identifier = self.bob_agent.agent_domain if self.bob_agent else str(bob_agent_id)
-            if analysis_cid:
-                tx_hash = self.alice_agent.request_validation(analysis_cid, validator_identifier)
-            else:
-                tx_hash = self.alice_sdk.request_validation(data_hash, bob_agent_id)
+            validator_address = self.bob_sdk.wallet_address
+            request_uri_base = analysis_cid or f"memory://analysis/{hashlib.sha256(str(analysis_data).encode()).hexdigest()}"
+            w3 = getattr(getattr(self.alice_sdk, "wallet_manager", None), "w3", None)
+
+            tx_hash = None
+            last_error: Optional[Exception] = None
+            for attempt in range(3):
+                request_uri = f"{request_uri_base}?nonce={int(time.time()*1000)+attempt}"
+
+                # ERC-8004 v1.0 expects the request hash to be keccak256(requestURI)
+                if w3 is not None:
+                    request_hash_bytes = w3.keccak(text=request_uri)
+                else:
+                    # Fallback to sha3_256 if web3 isn't available (shouldn't happen in studio flow)
+                    request_hash_bytes = hashlib.sha3_256(request_uri.encode()).digest()
+
+                request_hash_hex = "0x" + request_hash_bytes.hex()
+
+                try:
+                    tx_hash = self.alice_agent.sdk.chaos_agent.request_validation(
+                        validator_address,
+                        request_uri,
+                        request_hash_bytes
+                    )
+                    break
+                except ContractError as err:
+                    last_error = err
+                    err_text = str(err)
+                    # Handle duplicate request hash reverts by regenerating nonce
+                    if "0x7e273289" in err_text and attempt < 2:
+                        rprint("[yellow]⚠️  Validation request hash already used. Retrying with new nonce...[/yellow]")
+                        time.sleep(0.25)
+                        continue
+                    raise
+
+            if tx_hash is None:
+                raise last_error or ContractError("Validation request failed after retries")
             
             rprint(f"[green]📋 Validation Request Sent[/green]")
             rprint(f"   Validator: Bob")
@@ -1275,7 +1326,9 @@ class GenesisStudioX402Orchestrator:
                 "success": True,
                 "data_hash": data_hash,
                 "validator_agent_id": self.bob_sdk.get_agent_id(),
-                "tx_hash": tx_hash
+                "tx_hash": tx_hash,
+                "request_hash": request_hash_hex,
+                "request_uri": request_uri
             }
             
         except Exception as e:
@@ -1289,7 +1342,9 @@ class GenesisStudioX402Orchestrator:
                 "simulated": True,
                 "data_hash": data_hash,
                 "validator_agent_id": self.bob_sdk.get_agent_id(),
-                "error": str(e)
+                "error": str(e),
+                "request_hash": request_hash_hex,
+                "request_uri": request_uri
             }
         
         return tx_hash
