@@ -8,26 +8,31 @@ process integrity, ERC-8004 identity, and Coinbase x402 settlements:
 1. Register agents on ERC-8004 and link wallets.
 2. Execute EigenCompute-backed workloads with deterministic proofs.
 3. Run Google AP2 intent verification for user authorization.
-4. Perform three Alice ↔ Bob x402 settlements at 0.0001 USDC each.
+4. Perform three Bob → Alice x402 settlements at 0.0001 USDC each.
 5. Build enhanced evidence packages that include Eigen proofs and payment receipts.
 
 Usage:
     python genesis_studio.py
 """
 
+import argparse
 import os
 import sys
 import json
 import time
 import threading
 import hashlib
+import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Dict, Any, Optional, List
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Dict, Any, Optional, List, Tuple
+from urllib.parse import urljoin
 from rich.console import Console, Group
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from rich.panel import Panel
 from types import SimpleNamespace
+import requests
 
 # Add integrations to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "chaoschain_integrations"))
@@ -39,6 +44,11 @@ from rich.table import Table
 from chaoschain_sdk import ChaosChainAgentSDK, NetworkConfig
 from chaoschain_sdk.types import AgentRole, PaymentMethod, PaymentProof
 from chaoschain_sdk.exceptions import PaymentError, ContractError
+from eth_account import Account
+from eth_account.messages import encode_typed_data
+from eth_utils import to_checksum_address
+from py_ecc.bls import G2Basic as bls
+from web3 import Web3
 from web3.exceptions import TimeExhausted
 
 # Import agents
@@ -312,6 +322,470 @@ class StepRuntime:
             return None
 
 
+class FourMicaConfigurationError(RuntimeError):
+    """Raised when 4MICA credit configuration is invalid."""
+
+
+@dataclass
+class FourMicaSettings:
+    operator_url: str
+    rpc_url: str
+    contract_address: str
+    private_key: str
+    recipient_address: str
+    payment_amount_usdc: Decimal
+    payment_amount_eth: Decimal
+    payment_count: int
+    tab_id: Optional[str]
+    tab_ttl: Optional[int]
+    usdc_token: Optional[str]
+    usdc_decimals: Optional[int]
+    asset_symbol: str
+    x402_payer_agent: Optional[str]
+
+
+@dataclass
+class FourMicaGuaranteeRecord:
+    tab_id: int
+    tab_id_hex: str
+    req_id: int
+    label: str
+    amount_units: int
+    guarantee_id: str
+    guarantee_payload: Dict[str, Any]
+    request_latency: float
+    verify_latency: float
+    total_latency: float
+
+
+class FourMicaCreditFlow:
+    """Utility that mirrors demo_4mica_payments credit semantics."""
+
+    ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+    ERC20_DECIMALS_ABI = [
+        {
+            "constant": True,
+            "inputs": [],
+            "name": "decimals",
+            "outputs": [{"name": "", "type": "uint8"}],
+            "stateMutability": "view",
+            "type": "function",
+        }
+    ]
+
+    def __init__(self, console: Console):
+        self.console = console
+        self.settings = self._load_settings()
+        self.session = requests.Session()
+        self.base_url = self.settings.operator_url.rstrip("/") + "/"
+        self.w3 = Web3(Web3.HTTPProvider(self.settings.rpc_url))
+        if not self.w3.is_connected():
+            raise FourMicaConfigurationError(
+                f"Unable to connect to Ethereum RPC at {self.settings.rpc_url}"
+            )
+        self.payer_account = Account.from_key(self.settings.private_key)
+        self.payer_address = self.payer_account.address
+        self.recipient_address = to_checksum_address(self.settings.recipient_address)
+        self.asset_symbol, self.asset_address, self.asset_decimals = self._resolve_asset_metadata()
+        self.asset_multiplier = Decimal(10) ** self.asset_decimals
+
+    @staticmethod
+    def _load_settings() -> FourMicaSettings:
+        env = os.getenv
+        operator_url = env("FOURMICA_OPERATOR_URL")
+        private_key = env("FOURMICA_PRIVATE_KEY") or env("PRIVATE_KEY")
+        recipient = env("FOURMICA_RECIPIENT_ADDRESS")
+        rpc_url = env("FOURMICA_ETH_RPC_URL") or env("ETHEREUM_SEPOLIA_RPC_URL") or env("SEPOLIA_RPC_URL")
+        contract_address = env("FOURMICA_CONTRACT_ADDRESS")
+        missing = [
+            name
+            for name, value in (
+                ("FOURMICA_OPERATOR_URL", operator_url),
+                ("FOURMICA_PRIVATE_KEY", private_key),
+                ("FOURMICA_RECIPIENT_ADDRESS", recipient),
+                ("FOURMICA_ETH_RPC_URL", rpc_url),
+                ("FOURMICA_CONTRACT_ADDRESS", contract_address),
+            )
+            if not value
+        ]
+        if missing:
+            raise FourMicaConfigurationError(
+                "Missing required 4MICA environment variables: " + ", ".join(missing)
+            )
+
+        def _as_decimal(env_key: str, default: str) -> Decimal:
+            try:
+                return Decimal(env(env_key, default))
+            except Exception as exc:
+                raise FourMicaConfigurationError(
+                    f"Invalid decimal value for {env_key}: {env(env_key)}"
+                ) from exc
+
+        payment_amount_usdc = _as_decimal("FOURMICA_PAYMENT_AMOUNT_USDC", "0.0001")
+        payment_amount_eth = _as_decimal("FOURMICA_PAYMENT_AMOUNT_ETH", "0.001")
+        try:
+            payment_count = max(1, int(env("FOURMICA_PAYMENT_COUNT", "3")))
+        except ValueError as exc:
+            raise FourMicaConfigurationError("FOURMICA_PAYMENT_COUNT must be an integer") from exc
+        tab_id = env("FOURMICA_TAB_ID")
+        ttl_raw = env("FOURMICA_TAB_TTL_SECONDS")
+        tab_ttl = None
+        if ttl_raw:
+            try:
+                tab_ttl = int(ttl_raw)
+            except ValueError as exc:
+                raise FourMicaConfigurationError("FOURMICA_TAB_TTL_SECONDS must be numeric") from exc
+        usdc_token = env("FOURMICA_USDC_TOKEN")
+        decimals_raw = env("FOURMICA_USDC_DECIMALS")
+        usdc_decimals = None
+        if decimals_raw:
+            try:
+                usdc_decimals = int(decimals_raw)
+            except ValueError as exc:
+                raise FourMicaConfigurationError("FOURMICA_USDC_DECIMALS must be numeric") from exc
+        asset_symbol = env("FOURMICA_ASSET_SYMBOL") or ("USDC" if usdc_token else "ETH")
+        payer_agent = env("FOURMICA_X402_PAYER_AGENT") or env("X402_PAYER_AGENT")
+
+        return FourMicaSettings(
+            operator_url=operator_url,
+            rpc_url=rpc_url,
+            contract_address=contract_address,
+            private_key=private_key,
+            recipient_address=recipient,
+            payment_amount_usdc=payment_amount_usdc,
+            payment_amount_eth=payment_amount_eth,
+            payment_count=payment_count,
+            tab_id=tab_id,
+            tab_ttl=tab_ttl,
+            usdc_token=usdc_token,
+            usdc_decimals=usdc_decimals,
+            asset_symbol=asset_symbol,
+            x402_payer_agent=payer_agent,
+        )
+
+    def _resolve_asset_metadata(self) -> Tuple[str, str, int]:
+        if self.settings.usdc_token:
+            checksum_token = Web3.to_checksum_address(self.settings.usdc_token)
+            decimals = self.settings.usdc_decimals
+            if decimals is None:
+                decimals = self._read_token_decimals(checksum_token)
+            return (self.settings.asset_symbol or "USDC", checksum_token, decimals)
+        return (self.settings.asset_symbol or "ETH", self.ZERO_ADDRESS, 18)
+
+    def _read_token_decimals(self, token_address: str) -> int:
+        contract = self.w3.eth.contract(address=token_address, abi=self.ERC20_DECIMALS_ABI)
+        try:
+            return int(contract.functions.decimals().call())
+        except Exception as exc:
+            raise FourMicaConfigurationError(
+                f"Unable to read decimals() from token {token_address}: {exc}"
+            )
+
+    def _rest_get(self, path: str) -> Dict[str, Any]:
+        url = urljoin(self.base_url, path.lstrip("/"))
+        response = self.session.get(url, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    def _rest_post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        url = urljoin(self.base_url, path.lstrip("/"))
+        response = self.session.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    def _fetch_public_params(self) -> Dict[str, Any]:
+        return self._rest_get("core/public-params")
+
+    def _create_payment_tab(self, ttl: Optional[int]) -> Tuple[int, str, Optional[int]]:
+        payload: Dict[str, Any] = {
+            "user_address": self.payer_address,
+            "recipient_address": self.recipient_address,
+            "erc20_token": self.asset_address if self.asset_address != self.ZERO_ADDRESS else None,
+        }
+        if ttl:
+            payload["ttl"] = ttl
+        tab_info = self._rest_post("core/payment-tabs", payload)
+        raw_id = tab_info["id"]
+        tab_int = int(raw_id, 16) if isinstance(raw_id, str) else int(raw_id)
+        tab_hex = hex(tab_int)
+        tab_details = self._fetch_tab_info(tab_hex)
+        return tab_int, tab_hex, tab_details.get("start_timestamp")
+
+    def _fetch_tab_info(self, tab_hex: str) -> Dict[str, Any]:
+        return self._rest_get(f"core/tabs/{tab_hex}")
+
+    def _ensure_tab(self) -> Tuple[int, str, Optional[int]]:
+        if self.settings.tab_id:
+            tab_raw = self.settings.tab_id
+            tab_int = int(tab_raw, 16) if tab_raw.startswith("0x") else int(tab_raw)
+            tab_hex = hex(tab_int)
+            try:
+                details = self._fetch_tab_info(tab_hex)
+            except Exception:
+                details = {}
+            return tab_int, tab_hex, details.get("start_timestamp")
+        return self._create_payment_tab(self.settings.tab_ttl)
+
+    def _base_amount(self) -> Decimal:
+        if self.asset_address == self.ZERO_ADDRESS:
+            return self.settings.payment_amount_eth
+        return self.settings.payment_amount_usdc
+
+    def _build_eip712_message(
+        self,
+        public_params: Dict[str, Any],
+        tab_id: int,
+        req_id: int,
+        amount_units: int,
+        timestamp: int,
+    ) -> Dict[str, Any]:
+        return {
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                ],
+                "PaymentGuarantee": [
+                    {"name": "user", "type": "address"},
+                    {"name": "recipient", "type": "address"},
+                    {"name": "tabId", "type": "uint256"},
+                    {"name": "reqId", "type": "uint256"},
+                    {"name": "amount", "type": "uint256"},
+                    {"name": "timestamp", "type": "uint64"},
+                ],
+            },
+            "primaryType": "PaymentGuarantee",
+            "domain": {
+                "name": public_params["eip712_name"],
+                "version": public_params["eip712_version"],
+                "chainId": public_params["chain_id"],
+            },
+            "message": {
+                "user": self.payer_address,
+                "recipient": self.recipient_address,
+                "tabId": tab_id,
+                "reqId": req_id,
+                "amount": amount_units,
+                "timestamp": timestamp,
+            },
+        }
+
+    def _request_guarantee(
+        self,
+        public_params: Dict[str, Any],
+        tab_id: int,
+        req_id: int,
+        amount_units: int,
+        label: str,
+        fixed_timestamp: Optional[int],
+    ) -> Tuple[FourMicaGuaranteeRecord, int]:
+        timestamp = fixed_timestamp or int(datetime.now(timezone.utc).timestamp())
+        typed_data = self._build_eip712_message(public_params, tab_id, req_id, amount_units, timestamp)
+        message = encode_typed_data(full_message=typed_data)
+        signed = Account.sign_message(message, private_key=self.settings.private_key)
+        guarantee_request = {
+            "claims": {
+                "user_address": self.payer_address,
+                "recipient_address": self.recipient_address,
+                "tab_id": hex(tab_id),
+                "req_id": hex(req_id),
+                "amount": hex(amount_units),
+                "timestamp": timestamp,
+                "asset_address": self.asset_address,
+            },
+            "signature": signed.signature.hex(),
+            "scheme": "eip712",
+        }
+
+        with WaitBar(self.console, f"{label} · requesting credit guarantee") as request_wait:
+            guarantee_response = self._rest_post("core/guarantees", guarantee_request)
+        request_latency = request_wait.elapsed or 0.0
+
+        with WaitBar(self.console, f"{label} · verifying BLS certificate") as verify_wait:
+            public_key_raw = guarantee_response.get("public_key") or public_params.get("public_key")
+            if isinstance(public_key_raw, str):
+                public_key_bytes = bytes.fromhex(public_key_raw)
+            elif isinstance(public_key_raw, (bytes, bytearray)):
+                public_key_bytes = bytes(public_key_raw)
+            elif isinstance(public_key_raw, list):
+                public_key_bytes = bytes(public_key_raw)
+            else:
+                raise FourMicaConfigurationError("Unsupported operator public key format")
+            certificate_signature = bytes.fromhex(guarantee_response["signature"])
+            certificate_claims = bytes.fromhex(guarantee_response["claims"])
+            if not bls.Verify(public_key_bytes, certificate_claims, certificate_signature):
+                raise RuntimeError("BLS signature verification failed for guarantee")
+        verify_latency = verify_wait.elapsed or 0.0
+
+        guarantee_record = FourMicaGuaranteeRecord(
+            tab_id=tab_id,
+            tab_id_hex=hex(tab_id),
+            req_id=req_id,
+            label=label,
+            amount_units=amount_units,
+            guarantee_id=guarantee_response.get("id", str(uuid.uuid4())),
+            guarantee_payload={
+                "claims": guarantee_request["claims"],
+                "bls_signature": guarantee_response.get("signature"),
+            },
+            request_latency=request_latency,
+            verify_latency=verify_latency,
+            total_latency=request_latency + verify_latency,
+        )
+        return guarantee_record, timestamp
+
+    def _settle_aggregate(
+        self,
+        total_amount_units: int,
+        tab_id: int,
+        bob_sdk: ChaosChainAgentSDK,
+        payer_agent: str,
+        recipient_agent: str,
+        service_description: str,
+    ) -> Tuple[PaymentProof, Optional[Dict[str, Any]]]:
+        payment_manager = getattr(bob_sdk, "payment_manager", None)
+        if not payment_manager:
+            raise RuntimeError("ChaosChain payment manager unavailable for x402 settlement")
+
+        settlement_amount = Decimal(total_amount_units) / self.asset_multiplier
+        manager_request = payment_manager.create_x402_payment_request(
+            from_agent=payer_agent,
+            to_agent=recipient_agent,
+            amount=float(settlement_amount),
+            currency=self.asset_symbol or "USDC",
+            service_description=f"{service_description} (tab {hex(tab_id)})",
+        )
+        try:
+            payment_proof = payment_manager.execute_x402_payment(manager_request)
+        except PaymentError as err:
+            raise RuntimeError(f"x402 settlement failed: {err}") from err
+        except Exception as err:
+            raise RuntimeError(f"Unexpected error during x402 settlement: {err}") from err
+
+        receipt = None
+        tx_hash = getattr(payment_proof, "transaction_hash", None)
+        if tx_hash and getattr(bob_sdk, "wallet_manager", None):
+            try:
+                receipt = bob_sdk.wallet_manager.w3.eth.get_transaction_receipt(tx_hash)
+            except Exception as exc:
+                rprint(f"[yellow]⚠️  Could not fetch credit settlement receipt: {exc}[/yellow]")
+        return payment_proof, receipt
+
+    def execute(
+        self,
+        bob_sdk: ChaosChainAgentSDK,
+        payer_agent: str,
+        recipient_agent: str,
+        service_description: str,
+    ) -> Dict[str, Any]:
+        public_params = self._fetch_public_params()
+        base_amount = self._base_amount()
+        amount_units = int(base_amount * self.asset_multiplier)
+        tab_id, tab_hex, tab_timestamp = self._ensure_tab()
+        guarantees: List[FourMicaGuaranteeRecord] = []
+
+        for run_idx in range(self.settings.payment_count):
+            label = f"Credit Payment {run_idx + 1}/{self.settings.payment_count}"
+            guarantee, used_timestamp = self._request_guarantee(
+                public_params,
+                tab_id,
+                req_id=run_idx,
+                amount_units=amount_units,
+                label=label,
+                fixed_timestamp=tab_timestamp,
+            )
+            guarantees.append(guarantee)
+            if tab_timestamp is None:
+                tab_timestamp = used_timestamp
+            rprint(
+                f"[green]🛡️  {label} approved ({base_amount:.6f} {self.asset_symbol}).[/green]"
+            )
+
+        if not guarantees:
+            return {
+                "mode": "credit",
+                "runs": [],
+                "successes": 0,
+                "transactions": [],
+                "credit_guarantees": [],
+                "credit_metadata": {
+                    "tab_id": tab_hex,
+                    "credit_runs": 0,
+                    "asset_symbol": self.asset_symbol,
+                },
+                "expected_settlements": 1,
+                "amount": float(base_amount),
+            }
+
+        aggregate_units = sum(g.amount_units for g in guarantees)
+        aggregate_value = Decimal(aggregate_units) / self.asset_multiplier
+        settlement_prompt = (
+            f"Executing x402 settlement ({aggregate_value:.6f} {self.asset_symbol})"
+        )
+        with WaitBar(self.console, settlement_prompt) as wait:
+            payment_proof, settlement_receipt = self._settle_aggregate(
+                aggregate_units,
+                tab_id,
+                bob_sdk,
+                payer_agent,
+                recipient_agent,
+                service_description,
+            )
+        settlement_latency = wait.elapsed
+        rprint(
+            f"[green]✅ Credit settlement confirmed in {settlement_latency:.2f}s (tx {payment_proof.transaction_hash}).[/green]"
+        )
+
+        settlement_entry = {
+            "run": 1,
+            "status": "success",
+            "tx_hash": payment_proof.transaction_hash,
+            "payment_id": payment_proof.payment_id,
+            "amount": payment_proof.amount,
+            "currency": payment_proof.currency,
+            "receipt": payment_proof.receipt_data or {},
+            "proof": payment_proof,
+            "latency": settlement_latency,
+            "type": "credit_settlement",
+            "aggregated_guarantees": len(guarantees),
+            "tab_id": tab_hex,
+            "credit_total_amount": float(aggregate_value),
+        }
+        guarantee_snapshot = [
+            {
+                "label": g.label,
+                "guarantee_id": g.guarantee_id,
+                "latency": g.total_latency,
+                "amount": float(Decimal(g.amount_units) / self.asset_multiplier),
+                "tab_id": g.tab_id_hex,
+                "req_id": g.req_id,
+            }
+            for g in guarantees
+        ]
+        transactions = []
+        if settlement_entry.get("tx_hash"):
+            transactions.append({"label": "Bob→Alice credit settlement", "tx_hash": settlement_entry["tx_hash"]})
+
+        return {
+            "mode": "credit",
+            "runs": [settlement_entry],
+            "successes": 1,
+            "amount": float(aggregate_value),
+            "transactions": transactions,
+            "credit_guarantees": guarantee_snapshot,
+            "credit_metadata": {
+                "tab_id": tab_hex,
+                "credit_runs": len(guarantees),
+                "asset_symbol": self.asset_symbol,
+                "base_amount": float(base_amount),
+                "aggregate_amount": float(aggregate_value),
+                "operator": self.settings.operator_url,
+            },
+            "expected_settlements": 1,
+        }
+
+
 class StepProgressManager:
     """Aggregate per-step metrics for final reporting."""
 
@@ -406,13 +880,18 @@ ERC20_TRANSFER_ABI = [
 class GenesisStudioX402Orchestrator:
     """Enhanced Genesis Studio orchestrator with x402 payment integration"""
     
-    def __init__(self):
+    def __init__(self, payment_mode: str = "debit"):
         # Track results for final summary
         self.results = {}
         self.console = Console()
         self.step_progress = StepProgressManager(self.console)
         self._demo_start: Optional[float] = None
         self.charlie_enabled = os.getenv("GENESIS_ENABLE_CHARLIE", "0").lower() in ("1", "true", "yes")
+        normalized_mode = (payment_mode or os.getenv("GENESIS_PAYMENT_MODE", "debit")).strip().lower()
+        if normalized_mode not in {"debit", "credit"}:
+            normalized_mode = "debit"
+        self.payment_mode = normalized_mode
+        os.environ["GENESIS_PAYMENT_MODE"] = self.payment_mode
         
         # Agent SDK instances
         self.alice_sdk = None  # Server Agent
@@ -626,14 +1105,24 @@ class GenesisStudioX402Orchestrator:
             if storage_tx:
                 step.record_transaction("Analysis evidence storage", storage_tx)
         
-        # Step 8: x402 Settlements between Alice and Bob
-        rprint(f"\n[blue]🔧 Step 8: Executing three Alice ↔ Bob x402 settlements ({self.payment_token_symbol})...[/blue]")
-        with self.step_progress.step("Step 8: Alice ↔ Bob settlements") as step:
-            payment_results = self._execute_alice_bob_payment_series("Eigen loan workflow settlement")
+        # Step 8: x402 Settlements between Bob and Alice
+        if self.payment_mode == "credit":
+            payment_caption = f"\n[blue]🔧 Step 8: Executing Bob → Alice x402 credit settlement via 4MICA ({self.payment_token_symbol})...[/blue]"
+            step_label = "Step 8: Bob → Alice credit settlement"
+            payment_executor = self._execute_credit_payment_series
+        else:
+            payment_caption = f"\n[blue]🔧 Step 8: Executing three Bob → Alice x402 settlements ({self.payment_token_symbol})...[/blue]"
+            step_label = "Step 8: Bob → Alice settlements"
+            payment_executor = self._execute_alice_bob_payment_series
+
+        rprint(payment_caption)
+        payment_results = payment_executor("Eigen loan workflow settlement")
+        with self.step_progress.step(step_label) as step:
             successful_txs = [entry["tx_hash"] for entry in payment_results.get("runs", []) if entry.get("tx_hash")]
-            reference_value = successful_txs[-1] if successful_txs else f"{payment_results.get('successes', 0)}/3 settlements"
+            expected_total = payment_results.get("expected_settlements", 3)
+            reference_value = successful_txs[-1] if successful_txs else f"{payment_results.get('successes', 0)}/{expected_total} settlements"
             step.set_reference(reference_value)
-            w3 = self.alice_sdk.wallet_manager.w3 if self.alice_sdk else None
+            w3 = self.bob_sdk.wallet_manager.w3 if self.bob_sdk else None
             for tx in payment_results.get("transactions", []):
                 step.record_transaction(tx["label"], tx["tx_hash"], w3=w3)
         
@@ -1139,10 +1628,10 @@ class GenesisStudioX402Orchestrator:
             return None
 
     def _execute_alice_bob_payment_series(self, service_description: str) -> Dict[str, Any]:
-        """Execute three consecutive x402 settlements between Alice and Bob."""
-        payment_manager = getattr(self.alice_sdk, "payment_manager", None)
+        """Execute three consecutive x402 settlements between Bob and Alice."""
+        payment_manager = getattr(self.bob_sdk, "payment_manager", None)
         if not payment_manager:
-            rprint("[red]❌ Alice SDK missing payment manager; cannot execute x402 settlements[/red]")
+            rprint("[red]❌ Bob SDK missing payment manager; cannot execute x402 settlements[/red]")
             self.results["alice_bob_payments"] = {"runs": [], "successes": 0, "transactions": []}
             return self.results["alice_bob_payments"]
 
@@ -1157,13 +1646,13 @@ class GenesisStudioX402Orchestrator:
             latency: Optional[float] = None
             try:
                 manager_request = payment_manager.create_x402_payment_request(
-                    from_agent=self.alice_agent.agent_name,
-                    to_agent=self.bob_agent.agent_name,
+                    from_agent=self.bob_agent.agent_name,
+                    to_agent=self.alice_agent.agent_name,
                     amount=payment_amount,
                     currency=self.payment_token_symbol,
                     service_description=f"{service_description} #{run_index}"
                 )
-                wait_title = f"Alice → Bob x402 payment #{run_index} ({payment_amount:.4f} {self.payment_token_symbol})"
+                wait_title = f"Bob → Alice x402 payment #{run_index} ({payment_amount:.4f} {self.payment_token_symbol})"
                 with WaitBar(self.console, wait_title) as wait:
                     payment_proof = payment_manager.execute_x402_payment(manager_request)
                     latency = wait.elapsed
@@ -1197,7 +1686,7 @@ class GenesisStudioX402Orchestrator:
                 "latency": latency
             })
             tx_records.append({
-                "label": f"Alice→Bob settlement #{run_index}",
+                "label": f"Bob→Alice settlement #{run_index}",
                 "tx_hash": payment_proof.transaction_hash
             })
 
@@ -1206,9 +1695,72 @@ class GenesisStudioX402Orchestrator:
             "runs": runs,
             "successes": successes,
             "amount": payment_amount,
-            "transactions": tx_records
+            "transactions": tx_records,
+            "expected_settlements": total_runs,
+            "mode": "debit"
         }
         return self.results["alice_bob_payments"]
+
+    def _execute_credit_payment_series(self, service_description: str) -> Dict[str, Any]:
+        if not self.bob_sdk or not self.alice_agent:
+            rprint("[red]❌ Missing Bob/Alice agents; credit settlement unavailable[/red]")
+            failure = {
+                "mode": "credit",
+                "runs": [],
+                "successes": 0,
+                "transactions": [],
+                "credit_guarantees": [],
+                "credit_metadata": {},
+                "expected_settlements": 1,
+                "amount": 0,
+            }
+            self.results["alice_bob_payments"] = failure
+            return failure
+
+        try:
+            credit_flow = FourMicaCreditFlow(self.console)
+        except FourMicaConfigurationError as exc:
+            rprint(f"[red]❌ 4MICA credit configuration error: {exc}[/red]")
+            failure = {
+                "mode": "credit",
+                "runs": [],
+                "successes": 0,
+                "transactions": [],
+                "credit_guarantees": [],
+                "credit_metadata": {"error": str(exc)},
+                "expected_settlements": 1,
+                "amount": 0,
+                "error": str(exc)
+            }
+            self.results["alice_bob_payments"] = failure
+            return failure
+
+        payer_agent = credit_flow.settings.x402_payer_agent or getattr(
+            self.bob_agent, "agent_name", getattr(self.bob_sdk, "agent_name", "Bob")
+        )
+        recipient_agent = getattr(self.alice_agent, "agent_name", getattr(self.alice_sdk, "agent_name", "Alice"))
+        try:
+            result = credit_flow.execute(
+                bob_sdk=self.bob_sdk,
+                payer_agent=payer_agent,
+                recipient_agent=recipient_agent,
+                service_description=service_description,
+            )
+        except Exception as exc:
+            rprint(f"[red]❌ 4MICA credit execution error: {exc}[/red]")
+            result = {
+                "mode": "credit",
+                "runs": [],
+                "successes": 0,
+                "transactions": [],
+                "credit_guarantees": [],
+                "credit_metadata": {"error": str(exc)},
+                "expected_settlements": 1,
+                "amount": 0,
+                "error": str(exc)
+            }
+        self.results["alice_bob_payments"] = result
+        return result
 
     def _get_latest_bob_payment_receipt(self) -> Optional[Dict[str, Any]]:
         runs = self.results.get("alice_bob_payments", {}).get("runs", [])
@@ -1472,7 +2024,7 @@ class GenesisStudioX402Orchestrator:
             payment_receipt = self._get_latest_bob_payment_receipt()
             validation_payment_result = payment_receipt.get("proof") if payment_receipt else None
             if payment_receipt:
-                rprint(f"\n[cyan]💰 Referencing Alice → Bob settlement for validation payout[/cyan]")
+                rprint(f"\n[cyan]💰 Referencing Bob → Alice settlement for validation payout[/cyan]")
                 rprint(f"[green]💳 Settlement Transaction: {payment_receipt['tx_hash']}[/green]")
                 rprint(f"   Amount: {payment_receipt['amount']} {payment_receipt['currency']}")
             else:
@@ -1769,17 +2321,46 @@ class GenesisStudioX402Orchestrator:
             process_proof.get("execution_hash", "N/A")
         )
 
-        payments = self.results.get("alice_bob_payments", {}).get("runs", [])
+        payment_state = self.results.get("alice_bob_payments", {})
+        payments = payment_state.get("runs", [])
+        payment_mode = payment_state.get("mode", "debit")
         successful_payments = [entry for entry in payments if entry.get("status") == "success"]
         if successful_payments:
+            credit_runs = payment_state.get("credit_metadata", {}).get(
+                "credit_runs",
+                len(payment_state.get("credit_guarantees", []))
+            )
             for entry in successful_payments:
+                detail = f"Bob → Alice {entry['amount']} {entry['currency']}"
+                if payment_mode == "credit" and credit_runs:
+                    detail = f"{detail} (credit aggregate of {credit_runs} guarantees)"
                 summary_table.add_row(
                     f"Settlement #{entry['run']}",
-                    f"Alice → Bob {entry['amount']} {entry['currency']}",
+                    detail,
                     entry.get("tx_hash", "N/A")
                 )
         else:
             summary_table.add_row("Settlements", "No successful settlements recorded", "N/A")
+
+        if payment_mode == "credit" and payment_state.get("credit_guarantees"):
+            guarantee_count = len(payment_state["credit_guarantees"])
+            aggregate_amount = payment_state.get("credit_metadata", {}).get(
+                "aggregate_amount",
+                payment_state.get("amount", 0)
+            )
+            if isinstance(aggregate_amount, (int, float)):
+                aggregate_text = f"{aggregate_amount:.6f}"
+            else:
+                aggregate_text = str(aggregate_amount)
+            asset_symbol = payment_state.get("credit_metadata", {}).get(
+                "asset_symbol",
+                self.payment_token_symbol
+            )
+            summary_table.add_row(
+                "Credit Guarantees",
+                f"{guarantee_count} approvals → {aggregate_text} {asset_symbol}",
+                payment_state.get("credit_metadata", {}).get("tab_id", "N/A")
+            )
 
         enhanced_evidence = self.results.get("enhanced_evidence", {})
         if enhanced_evidence:
@@ -1794,11 +2375,21 @@ class GenesisStudioX402Orchestrator:
         console.print("Eigen AI + Eigen Compute proofs linked above ensure deterministic execution.")
     
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="ChaosChain Genesis Studio demo")
+    parser.add_argument(
+        "--payment",
+        choices=["debit", "credit"],
+        default=os.getenv("GENESIS_PAYMENT_MODE", "debit"),
+        help="Select x402 settlement mode: direct debit (default) or 4MICA credit",
+    )
+    return parser.parse_args()
+
+
 def main():
     """Main entry point for the Eigen-integrated Genesis Studio"""
-    
-    # Initialize and run the orchestrator
-    orchestrator = GenesisStudioX402Orchestrator()
+    args = parse_args()
+    orchestrator = GenesisStudioX402Orchestrator(payment_mode=args.payment)
     orchestrator.run_complete_demo()
 
 
