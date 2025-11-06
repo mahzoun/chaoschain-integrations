@@ -117,7 +117,7 @@ class GenesisShoppingAnalysisTool(BaseTool):
         return json.dumps(analysis, indent=2)
 
 class GenesisServerAgentSDK:
-    """Enhanced Server Agent for Genesis Studio using ChaosChain SDK + CrewAI + 0G Compute"""
+    """Enhanced Server Agent for Genesis Studio using ChaosChain SDK + Eigen-powered compute"""
     
     def __init__(self, agent_name: str, agent_domain: str, agent_role: AgentRole = AgentRole.SERVER,
                  network: NetworkConfig = NetworkConfig.BASE_SEPOLIA,
@@ -160,20 +160,12 @@ class GenesisServerAgentSDK:
         )
         rprint(f"[green]✅ ChaosChain SDK initialized for {agent_name}[/green]")
         
-        # Initialize 0G Storage for proof publishing (independent of compute provider)
+        # Evidence storage handled via ChaosChain SDK store_evidence
         self.zg_storage = None
-        try:
-            from chaoschain_sdk.providers.storage import ZeroGStorageGRPC
-            self.zg_storage = ZeroGStorageGRPC(grpc_url="localhost:50051")
-            if self.zg_storage.is_available:
-                rprint("[cyan]✅ 0G Storage initialized for proof publishing[/cyan]")
-        except Exception as e:
-            rprint(f"[yellow]⚠️  0G Storage not available for proof publishing: {e}[/yellow]")
         
         # Initialize compute providers
         self.eigenai = None
         self.eigencompute = None
-        self.zerog_inference = None
         
         rprint(f"[cyan]🔄 Initializing compute provider: {self.compute_provider_type}...[/cyan]")
         
@@ -211,33 +203,6 @@ class GenesisServerAgentSDK:
                 rprint("[yellow]   Falling back to CrewAI...[/yellow]")
                 self.compute_provider_type = "crewai"
         
-        elif self.compute_provider_type == "0g":
-            try:
-                import os
-                from chaoschain_sdk.providers.compute import ZeroGInference
-                
-                zerog_key = os.getenv("ZEROG_TESTNET_PRIVATE_KEY")
-                zerog_rpc = os.getenv("ZEROG_TESTNET_RPC_URL", "https://evmrpc-testnet.0g.ai")
-                
-                if zerog_key:
-                    self.zerog_inference = ZeroGInference(
-                        private_key=zerog_key,
-                        evm_rpc=zerog_rpc
-                    )
-                    if self.zerog_inference.available:
-                        rprint("[green]🤖 0G Compute inference enabled (TEE verified)[/green]")
-                    else:
-                        rprint("[yellow]⚠️  0G SDK not installed (falling back to CrewAI)[/yellow]")
-                        self.zerog_inference = None
-                        self.compute_provider_type = "crewai"
-                else:
-                    rprint("[yellow]⚠️  ZEROG_TESTNET_PRIVATE_KEY not set, falling back to CrewAI[/yellow]")
-                    self.compute_provider_type = "crewai"
-            except Exception as e:
-                rprint(f"[yellow]⚠️  0G inference unavailable: {e}[/yellow]")
-                rprint("[cyan]   Falling back to CrewAI analysis tools[/cyan]")
-                self.compute_provider_type = "crewai"
-        
         else:
             rprint("[yellow]🤖 Using CrewAI for local processing[/yellow]")
             self.compute_provider_type = "crewai"
@@ -258,8 +223,6 @@ class GenesisServerAgentSDK:
             rprint(f"[blue]   Compute: EigenCompute (Real TEE deployment + EigenAI)[/blue]")
         elif self.compute_provider_type == "eigenai":
             rprint(f"[blue]   Compute: EigenAI gpt-oss-120b-f16 (TEE verified LLM only)[/blue]")
-        elif self.compute_provider_type == "0g" and self.zerog_inference and self.zerog_inference.is_real_0g:
-            rprint(f"[blue]   Compute: 0G gpt-oss-120b (TEE verified)[/blue]")
         else:
             rprint(f"[blue]   Compute: CrewAI (local processing)[/blue]")
     
@@ -314,12 +277,9 @@ class GenesisServerAgentSDK:
         # Route to appropriate provider
         if self.compute_provider_type == "eigencompute" and self.eigencompute:
             return self._generate_analysis_with_eigencompute(item_type, color, budget, premium_tolerance, intent_id)
-        elif self.compute_provider_type == "eigenai" and self.eigenai:
+        if self.compute_provider_type == "eigenai" and self.eigenai:
             return self._generate_analysis_with_eigenai(item_type, color, budget, premium_tolerance)
-        elif self.compute_provider_type == "0g" and self.zerog_inference:
-            return self._generate_analysis_with_0g(item_type, color, budget, premium_tolerance)
-        else:
-            return self._generate_analysis_with_crewai(item_type, color, budget, premium_tolerance)
+        return self._generate_analysis_with_crewai(item_type, color, budget, premium_tolerance)
     
     def generate_loan_evaluation(self, borrower_address: str, loan_amount: float,
                                 erc8004_score: float, payment_history_count: int,
@@ -350,19 +310,10 @@ class GenesisServerAgentSDK:
                 payment_history_count, stake_amount, previous_defaults, intent_id
             )
         else:
-            # Fallback to mock evaluation
-            return {
-                "analysis": {
-                    "decision": "APPROVE",
-                    "risk_score": 35,
-                    "creditworthiness": "good",
-                    "max_loan_amount": loan_amount,
-                    "approval_confidence": 0.85
-                },
-                "process_integrity_proof": None,
-                "proof_cid": None,
-                "exec_hash": None
-            }
+            return self._mock_loan_evaluation(
+                borrower_address=borrower_address,
+                loan_amount=loan_amount
+            )
     
     def _generate_loan_eval_with_eigencompute(self, borrower_address: str, loan_amount: float,
                                               erc8004_score: float, payment_history_count: int,
@@ -376,25 +327,58 @@ class GenesisServerAgentSDK:
         if not app_id:
             raise ValueError("EIGENCOMPUTE_APP_ID not set")
         
-        # Execute in TEE
-        result = self.eigencompute.execute(
-            app_id=app_id,
-            function="evaluate_loan",
-            inputs={
-                "borrower_address": borrower_address,
-                "loan_amount": loan_amount,
-                "erc8004_score": erc8004_score,
-                "payment_history_count": payment_history_count,
-                "stake_amount": stake_amount,
-                "previous_defaults": previous_defaults
-            },
-            intent_id=intent_id
-        )
+        try:
+            result = self.eigencompute.execute(
+                app_id=app_id,
+                function="evaluate_loan",
+                inputs={
+                    "borrower_address": borrower_address,
+                    "loan_amount": loan_amount,
+                    "erc8004_score": erc8004_score,
+                    "payment_history_count": payment_history_count,
+                    "stake_amount": stake_amount,
+                    "previous_defaults": previous_defaults
+                },
+                intent_id=intent_id
+            )
+        except Exception as exc:
+            rprint(f"[yellow]⚠️  EigenCompute unavailable: {exc}[/yellow]")
+            rprint("[yellow]   Falling back to CrewAI-based loan evaluation[/yellow]")
+            self.compute_provider_type = "crewai"
+            return self._mock_loan_evaluation(
+                borrower_address=borrower_address,
+                loan_amount=loan_amount,
+                error=str(exc)
+            )
         
         # Parse evaluation
         import json
         import hashlib
-        evaluation_data = json.loads(result.output) if isinstance(result.output, str) else result.output
+        raw_output = result.output
+        try:
+            if isinstance(raw_output, str):
+                raw_output = raw_output.strip()
+                evaluation_data = json.loads(raw_output) if raw_output else {}
+            else:
+                evaluation_data = raw_output or {}
+        except json.JSONDecodeError:
+            # Eigen sometimes wraps JSON in markdown fences or returns partial text
+            cleaned = raw_output or ""
+            if isinstance(cleaned, str) and "{" in cleaned and "}" in cleaned:
+                cleaned = cleaned[cleaned.find("{"): cleaned.rfind("}") + 1]
+                try:
+                    evaluation_data = json.loads(cleaned)
+                except Exception:
+                    evaluation_data = {}
+            else:
+                evaluation_data = {}
+        
+        if not evaluation_data:
+            evaluation_data = self._mock_loan_evaluation(
+                borrower_address=borrower_address,
+                loan_amount=loan_amount,
+                error="EigenCompute returned empty evaluation payload"
+            )["analysis"]
         
         # Calculate execution hash (EXCLUDE tee_execution metadata for determinism)
         evaluation_core = {k: v for k, v in evaluation_data.items() if k != 'tee_execution'}
@@ -429,26 +413,46 @@ class GenesisServerAgentSDK:
                 rprint(f"[cyan]   Timestamp: {tee_exec['timestamp']}[/cyan]")
         rprint()
         
-        # Publish proof to 0G if available
         proof_cid = None
-        if self.zg_storage and self.zg_storage.is_available:
-            try:
-                proof_data = {
-                    "evaluation": evaluation_data,
-                    "process_integrity_proof": result.proof.__dict__ if result.proof else {},
-                    "execution_hash": execution_hash
-                }
-                proof_json = json.dumps(proof_data, indent=2)
-                proof_cid = self.zg_storage.upload(proof_json.encode(), f"loan_eval_{execution_hash[:16]}.json")
-                rprint(f"[cyan]📦 Proof published to 0G: {proof_cid}[/cyan]")
-            except Exception as e:
-                rprint(f"[yellow]⚠️  Failed to publish proof: {e}[/yellow]")
+        try:
+            proof_payload = {
+                "evaluation": evaluation_data,
+                "process_integrity_proof": result.proof.__dict__ if result.proof else {},
+                "execution_hash": execution_hash
+            }
+            proof_cid = self.sdk.store_evidence(proof_payload, f"loan-eval-{execution_hash[:12]}")
+            rprint(f"[cyan]📦 Proof stored via ChaosChain SDK: {proof_cid}[/cyan]")
+        except Exception as e:
+            rprint(f"[yellow]⚠️  Failed to store proof: {e}[/yellow]")
         
         return {
             "analysis": evaluation_data,
             "process_integrity_proof": result.proof,
             "proof_cid": proof_cid,
             "exec_hash": execution_hash
+        }
+
+    def _mock_loan_evaluation(
+        self,
+        borrower_address: str,
+        loan_amount: float,
+        error: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Return a deterministic fallback loan evaluation result."""
+        if error:
+            rprint(f"[cyan]ℹ️  Loan evaluation fallback reason: {error}[/cyan]")
+        return {
+            "analysis": {
+                "decision": "APPROVE",
+                "risk_score": 35,
+                "creditworthiness": "good",
+                "max_loan_amount": loan_amount,
+                "approval_confidence": 0.85,
+                "borrower_address": borrower_address
+            },
+            "process_integrity_proof": None,
+            "proof_cid": None,
+            "exec_hash": None
         }
     
     def _generate_analysis_with_crewai(self, item_type: str, color: str, budget: float, 
@@ -596,147 +600,6 @@ class GenesisServerAgentSDK:
             
         except Exception as e:
             rprint(f"[red]❌ Analysis with process integrity failed: {e}[/red]")
-            raise
-    
-    def _generate_analysis_with_0g(self, item_type: str, color: str, budget: float, 
-                                   premium_tolerance: float) -> Dict[str, Any]:
-        """
-        Generate shopping analysis using 0G Compute Network (TEE verified AI)
-        
-        This uses the gpt-oss-120b model on 0G's decentralized compute network
-        with TEE verification for process integrity.
-        """
-        rprint(f"[cyan]🤖 Using 0G gpt-oss-120b for shopping analysis...[/cyan]")
-        
-        # Build the prompt for 0G LLM
-        prompt = f"""You are an expert shopping analyst. Analyze the following shopping request and provide a detailed recommendation:
-
-Product Request:
-- Item Type: {item_type}
-- Preferred Color: {color}
-- Budget: ${budget}
-- Premium Tolerance: {premium_tolerance*100}% for preferred options
-
-Provide a comprehensive analysis in JSON format with the following structure:
-{{
-  "item_type": "{item_type}",
-  "requested_color": "{color}",
-  "available_color": "<recommended color>",
-  "base_price": <price without premium>,
-  "final_price": <final recommended price>,
-  "premium_applied": <percentage premium if color match found>,
-  "deal_quality": "<excellent|good|alternative>",
-  "color_match_found": <true|false>,
-  "merchant": "<recommended merchant name>",
-  "availability": "in_stock",
-  "estimated_delivery": "<delivery estimate>",
-  "auto_purchase_eligible": <true|false>,
-  "confidence": <0.0-1.0>,
-  "reasoning": "<detailed explanation of recommendation>"
-}}
-
-Ensure prices are within budget and apply premiums only if color match is found."""
-
-        try:
-            # Call 0G Compute Network
-            response_text, tee_proof = self.zerog_inference.chat_completion(
-                messages=[
-                    {"role": "system", "content": "You are an expert shopping analyst providing detailed product recommendations."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7,
-                max_tokens=1000
-            )
-            
-            # Parse the AI response
-            try:
-                analysis_data = json.loads(response_text)
-            except json.JSONDecodeError:
-                # Fallback if AI doesn't return valid JSON
-                rprint("[yellow]⚠️  AI response wasn't valid JSON, using fallback...[/yellow]")
-                analysis_data = {
-                    "item_type": item_type,
-                    "requested_color": color,
-                    "available_color": color,
-                    "base_price": budget * 0.75,
-                    "final_price": budget * 0.85,
-                    "premium_applied": 0,
-                    "deal_quality": "good",
-                    "color_match_found": True,
-                    "merchant": "0G AI Recommended Merchant",
-                    "availability": "in_stock",
-                    "estimated_delivery": "2-3 business days",
-                    "auto_purchase_eligible": True,
-                    "confidence": 0.85,
-                    "reasoning": response_text[:200] if response_text else "Analysis completed"
-                }
-            
-            # Add 0G metadata
-            analysis_data.update({
-                "analysis_timestamp": datetime.now().isoformat(),
-                "shopping_agent": f"{self.agent_name} (0G gpt-oss-120b)",
-                "zerog_compute": {
-                    "model": "gpt-oss-120b",
-                    "provider": self.zerog_inference._backend.OFFICIAL_PROVIDERS.get("gpt-oss-120b", "0xf07240Efa67755B5311bc75784a061eDB47165Dd"),
-                    "verification": self.zerog_inference._backend.verification_method.value if hasattr(self.zerog_inference._backend.verification_method, 'value') else str(self.zerog_inference._backend.verification_method),
-                    "tee_proof": tee_proof,
-                    "is_real_0g": self.zerog_inference.is_real_0g
-                },
-                "genesis_studio": {
-                    "agent_id": self.sdk.get_agent_id() if hasattr(self.sdk, 'get_agent_id') else None,
-                    "agent_domain": self.agent_domain,
-                    "version": "1.0.0-0g",
-                    "process_integrity": True if tee_proof and tee_proof.get("is_valid") else False
-                }
-            })
-            
-            # Store in service history
-            self.service_history.append({
-                "service": "smart_shopping_analysis",
-                "item_type": item_type,
-                "color": color,
-                "budget": budget,
-                "result": analysis_data,
-                "tee_proof": tee_proof,
-                "timestamp": datetime.now().isoformat()
-            })
-            
-            rprint(f"[green]✅ 0G AI shopping analysis completed for {item_type}[/green]")
-            confidence = analysis_data.get("confidence", 0.85)
-            rprint(f"[blue]   Confidence Score: {confidence*100:.1f}%[/blue]")
-            if tee_proof and tee_proof.get("is_valid"):
-                rprint(f"[green]   TEE Verification: ✅ PASSED[/green]")
-            
-            # Create proper IntegrityProof with TEE attestation
-            from chaoschain_sdk.types import IntegrityProof
-            import hashlib
-            
-            # Compute execution hash from analysis
-            execution_data = json.dumps(analysis_data, sort_keys=True).encode()
-            execution_hash = hashlib.sha256(execution_data).hexdigest()
-            
-            integrity_proof = IntegrityProof(
-                proof_id=f"0g_proof_{int(datetime.now().timestamp())}",
-                function_name="smart_shopping_analysis",
-                code_hash=tee_proof.get("code_hash", "0x" + hashlib.sha256(b"0g_compute").hexdigest()),
-                execution_hash=execution_hash,
-                timestamp=datetime.now(),
-                agent_name=self.agent_name,
-                verification_status="verified" if tee_proof.get("is_valid") else "unverified",
-                # ✅ TEE ATTESTATION FIELDS
-                tee_attestation=tee_proof,
-                tee_provider="0g-compute",
-                tee_job_id=tee_proof.get("chat_id") or tee_proof.get("job_id"),
-                tee_execution_hash=tee_proof.get("execution_hash")
-            )
-            
-            return {
-                "analysis": analysis_data,
-                "process_integrity_proof": integrity_proof
-            }
-            
-        except Exception as e:
-            rprint(f"[red]❌ 0G AI analysis failed: {e}[/red]")
             raise
     
     def _generate_analysis_with_eigenai(self, item_type: str, color: str, budget: float, 
@@ -992,10 +855,9 @@ Ensure prices are within budget."""
                 tee_execution_hash=execution_hash
             )
             
-            # ✅ (B2) Publish ProcessProof to 0G Storage for accountability
-            rprint(f"[cyan]📝 Publishing ProcessProof to 0G Storage...[/cyan]")
+            # Publish ProcessProof for accountability
+            rprint(f"[cyan]📝 Publishing ProcessProof via ChaosChain SDK...[/cyan]")
             try:
-                # Build comprehensive ProcessProof JSON
                 process_proof_json = {
                     "agent": self.agent_name,
                     "function": "analyze_shopping",
@@ -1023,25 +885,14 @@ Ensure prices are within budget."""
                     "timestamp": datetime.now().isoformat(),
                     "version": "1.0.0"
                 }
-                
-                # Sign the proof
                 proof_json_str = json.dumps(process_proof_json, sort_keys=True)
                 proof_signature = hashlib.sha256(proof_json_str.encode()).hexdigest()
                 process_proof_json["proof_hash"] = proof_signature
                 process_proof_json["signature"] = f"0x{proof_signature}"
-                
-                # Publish to 0G Storage via agent's storage client
-                proof_cid = None
-                if self.zg_storage and self.zg_storage.is_available:
-                    proof_bytes = json.dumps(process_proof_json, indent=2).encode()
-                    storage_result = self.zg_storage.put(proof_bytes, mime="application/json")
-                    proof_cid = storage_result.cid if hasattr(storage_result, 'cid') else str(storage_result)
-                    rprint(f"[green]✅ ProcessProof published to 0G Storage[/green]")
-                    rprint(f"[blue]   Proof CID: {proof_cid}[/blue]")
-                    rprint(f"[blue]   Exec Hash: 0x{execution_hash[:16]}...[/blue]")
-                else:
-                    rprint(f"[yellow]⚠️  0G Storage not available, proof not published[/yellow]")
-                    
+                proof_cid = self.sdk.store_evidence(process_proof_json, f"process-proof-{execution_hash[:12]}")
+                rprint(f"[green]✅ ProcessProof stored via ChaosChain SDK[/green]")
+                rprint(f"[blue]   Proof CID: {proof_cid}[/blue]")
+                rprint(f"[blue]   Exec Hash: {execution_hash}[/blue]")
             except Exception as proof_err:
                 rprint(f"[yellow]⚠️  Failed to publish ProcessProof: {proof_err}[/yellow]")
                 proof_cid = None

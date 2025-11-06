@@ -28,6 +28,7 @@ class EigenComputeAdapter(ComputeBackend):
         api_url: Optional[str] = None,
         api_key: Optional[str] = None,
         use_grpc: bool = True,
+        sidecar_url: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
     ) -> None:
         """
@@ -37,6 +38,7 @@ class EigenComputeAdapter(ComputeBackend):
             api_url: Eigen API endpoint
             api_key: Optional API key
             use_grpc: Use gRPC instead of HTTP
+            sidecar_url: Optional gRPC sidecar endpoint (unused, kept for backwards compatibility)
             timeout_seconds: Default timeout for operations
         """
         self.client = EigenComputeClient(
@@ -45,6 +47,7 @@ class EigenComputeAdapter(ComputeBackend):
             use_grpc=use_grpc,
             timeout_seconds=timeout_seconds,
         )
+        self.sidecar_url = sidecar_url
         self.default_timeout = timeout_seconds or 600
         logger.info("eigen_compute_adapter_initialized")
 
@@ -145,3 +148,34 @@ class EigenComputeAdapter(ComputeBackend):
 
         return response.cancelled
 
+    def execute(
+        self,
+        *,
+        app_id: Optional[str] = None,
+        function: Optional[str] = None,
+        inputs: Optional[Dict[str, Any]] = None,
+        wait_for_result: bool = True,
+        timeout_s: int = 600,
+        **extra_kwargs: Any,
+    ) -> ComputeResult:
+        """
+        High-level helper used by agents/tests.
+
+        Args:
+            app_id: EigenCompute application identifier (informational)
+            function: Function name being executed
+            inputs: Arbitrary payload forwarded to EigenCompute
+            wait_for_result: Whether to poll for completion
+            timeout_s: Maximum wait duration
+        """
+        payload_inputs = dict(inputs or {})
+        if extra_kwargs:
+            payload_inputs.update(extra_kwargs)
+
+        task = {
+            "app_id": app_id,
+            "function": function or "execute",
+            "inputs": payload_inputs,
+        }
+        job_id = self.submit(task)
+        return self.result(job_id, wait=wait_for_result, timeout_s=timeout_s)

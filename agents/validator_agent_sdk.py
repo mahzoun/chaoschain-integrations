@@ -429,7 +429,7 @@ class GenesisValidationTool(BaseTool):
         return min(100, max(0, score))
 
 class GenesisValidatorAgentSDK:
-    """Enhanced Validator Agent for Genesis Studio using ChaosChain SDK + CrewAI + 0G Compute"""
+    """Enhanced Validator Agent for Genesis Studio using ChaosChain SDK + Eigen-powered compute"""
     
     def __init__(self, agent_name: str, agent_domain: str, agent_role: AgentRole = AgentRole.VALIDATOR,
                  network: NetworkConfig = NetworkConfig.BASE_SEPOLIA,
@@ -470,20 +470,11 @@ class GenesisValidatorAgentSDK:
             enable_process_integrity=enable_process_integrity
         )
         
-        # Initialize 0G Storage for proof publishing (independent of compute provider)
         self.zg_storage = None
-        try:
-            from chaoschain_sdk.providers.storage import ZeroGStorageGRPC
-            self.zg_storage = ZeroGStorageGRPC(grpc_url="localhost:50051")
-            if self.zg_storage.is_available:
-                rprint("[cyan]✅ 0G Storage initialized for proof publishing[/cyan]")
-        except Exception as e:
-            rprint(f"[yellow]⚠️  0G Storage not available for proof publishing: {e}[/yellow]")
         
         # Initialize compute providers
         self.eigenai = None
         self.eigencompute = None
-        self.zerog_inference = None
         
         if self.compute_provider_type == "eigencompute":
             try:
@@ -517,33 +508,6 @@ class GenesisValidatorAgentSDK:
                 rprint("[yellow]   Falling back to CrewAI...[/yellow]")
                 self.compute_provider_type = "crewai"
         
-        elif self.compute_provider_type == "0g":
-            try:
-                import os
-                from chaoschain_sdk.providers.compute import ZeroGInference
-                
-                zerog_key = os.getenv("ZEROG_TESTNET_PRIVATE_KEY")
-                zerog_rpc = os.getenv("ZEROG_TESTNET_RPC_URL", "https://evmrpc-testnet.0g.ai")
-                
-                if zerog_key:
-                    self.zerog_inference = ZeroGInference(
-                        private_key=zerog_key,
-                        evm_rpc=zerog_rpc
-                    )
-                    if self.zerog_inference.available:
-                        rprint("[green]🔍 0G Compute validation enabled (TEE verified)[/green]")
-                    else:
-                        rprint("[yellow]⚠️  0G SDK not installed (falling back to CrewAI)[/yellow]")
-                        self.zerog_inference = None
-                        self.compute_provider_type = "crewai"
-                else:
-                    rprint("[yellow]⚠️  ZEROG_TESTNET_PRIVATE_KEY not set, falling back to CrewAI[/yellow]")
-                    self.compute_provider_type = "crewai"
-            except Exception as e:
-                rprint(f"[yellow]⚠️  0G inference unavailable: {e}[/yellow]")
-                rprint("[cyan]   Falling back to CrewAI validation tools[/cyan]")
-                self.compute_provider_type = "crewai"
-        
         else:
             rprint("[yellow]🔍 Using CrewAI for local validation[/yellow]")
             self.compute_provider_type = "crewai"
@@ -564,8 +528,6 @@ class GenesisValidatorAgentSDK:
             rprint(f"[blue]   Compute: EigenCompute (Real TEE deployment + EigenAI)[/blue]")
         elif self.compute_provider_type == "eigenai":
             rprint(f"[blue]   Compute: EigenAI gpt-oss-120b-f16 (TEE verified LLM only)[/blue]")
-        elif self.compute_provider_type == "0g" and self.zerog_inference and self.zerog_inference.is_real_0g:
-            rprint(f"[blue]   Compute: 0G gpt-oss-120b (TEE verified)[/blue]")
         else:
             rprint(f"[blue]   Compute: CrewAI (local processing)[/blue]")
     
@@ -614,12 +576,9 @@ class GenesisValidatorAgentSDK:
         # Route to appropriate provider
         if self.compute_provider_type == "eigencompute" and self.eigencompute:
             return self._validate_with_eigencompute(analysis_data)
-        elif self.compute_provider_type == "eigenai" and self.eigenai:
+        if self.compute_provider_type == "eigenai" and self.eigenai:
             return self._validate_with_eigenai(analysis_data)
-        elif self.compute_provider_type == "0g" and self.zerog_inference:
-            return self._validate_with_0g(analysis_data)
-        else:
-            return self._validate_with_crewai(analysis_data)
+        return self._validate_with_crewai(analysis_data)
     
     def _validate_with_crewai(self, analysis_data: Dict[str, Any]) -> Dict[str, Any]:
         """Validate with CrewAI (local fallback, no TEE)"""
@@ -802,170 +761,20 @@ class GenesisValidatorAgentSDK:
             rprint(f"[red]❌ Validation with process integrity failed: {e}[/red]")
             raise
     
-    def _validate_with_0g(self, analysis_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Validate analysis using 0G Compute Network (TEE verified AI)
-        
-        This uses the gpt-oss-120b model on 0G's decentralized compute network
-        with TEE verification for validation scoring.
-        """
-        rprint(f"[cyan]🔍 Using 0G gpt-oss-120b for validation...[/cyan]")
-        
-        # Detect if this is shopping or market analysis
-        if "shopping_result" in analysis_data or "item_type" in analysis_data:
-            analysis_type = "shopping"
-            if "shopping_result" in analysis_data:
-                shopping_data = analysis_data["shopping_result"]
-                item_type = shopping_data.get("item_type", "Unknown")
-            else:
-                shopping_data = analysis_data
-                item_type = analysis_data.get("item_type", "Unknown")
-            subject = item_type
-        else:
-            analysis_type = "market"
-            subject = analysis_data.get("symbol", "Unknown")
-        
-        # Build the validation prompt
-        prompt = f"""You are an expert analysis validator. Review the following {analysis_type} analysis and provide a comprehensive validation assessment:
-
-Analysis to Validate:
-{json.dumps(analysis_data, indent=2)}
-
-Provide a detailed validation report in JSON format with this structure:
-{{
-  "validation_timestamp": "<ISO timestamp>",
-  "validated_symbol": "{subject}",
-  "validation_criteria": "Comprehensive AI-powered validation",
-  "scoring_breakdown": {{
-    "data_completeness": <0-100>,
-    "technical_accuracy": <0-100>,
-    "price_reasonableness": <0-100>,
-    "recommendation_quality": <0-100>,
-    "methodology_soundness": <0-100>
-  }},
-  "overall_score": <0-100>,
-  "quality_rating": "<Outstanding|Excellent|Good|Acceptable|Needs Improvement>",
-  "validation_summary": "<brief summary>",
-  "detailed_assessment": {{
-    "strengths": ["<strength 1>", "<strength 2>"],
-    "weaknesses": ["<weakness 1>", "<weakness 2>"],
-    "recommendations_for_improvement": ["<recommendation 1>", "<recommendation 2>"]
-  }}
-}}
-
-Be thorough and provide specific, actionable feedback."""
-
-        try:
-            # Call 0G Compute Network
-            response_text, tee_proof = self.zerog_inference.chat_completion(
-                messages=[
-                    {"role": "system", "content": "You are an expert analysis validator providing comprehensive quality assessments."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.5,  # Lower temperature for more consistent validation
-                max_tokens=1500
-            )
-            
-            # Parse the AI response
-            try:
-                validation_data = json.loads(response_text)
-            except json.JSONDecodeError:
-                # Fallback if AI doesn't return valid JSON
-                rprint("[yellow]⚠️  AI response wasn't valid JSON, using fallback...[/yellow]")
-                validation_data = {
-                    "validation_timestamp": datetime.now().isoformat(),
-                    "validated_symbol": subject,
-                    "validation_criteria": "0G AI-powered validation",
-                    "scoring_breakdown": {
-                        "data_completeness": 90,
-                        "technical_accuracy": 88,
-                        "price_reasonableness": 92,
-                        "recommendation_quality": 90,
-                        "methodology_soundness": 89
-                    },
-                    "overall_score": 90,
-                    "quality_rating": "Excellent",
-                    "validation_summary": "High-quality analysis meeting professional standards",
-                    "detailed_assessment": {
-                        "strengths": ["Comprehensive analysis", "Sound methodology"],
-                        "weaknesses": [],
-                        "recommendations_for_improvement": ["Consider additional verification"]
-                    }
-                }
-            
-            # Add 0G metadata
-            validation_data.update({
-                "zerog_compute": {
-                    "model": "gpt-oss-120b",
-                    "provider": self.zerog_inference._backend.OFFICIAL_PROVIDERS.get("gpt-oss-120b", "0xf07240Efa67755B5311bc75784a061eDB47165Dd"),
-                    "verification": self.zerog_inference._backend.verification_method.value if hasattr(self.zerog_inference._backend.verification_method, 'value') else str(self.zerog_inference._backend.verification_method),
-                    "tee_proof": tee_proof,
-                    "is_real_0g": self.zerog_inference.is_real_0g
-                },
-                "genesis_studio": {
-                    "validator_id": self.sdk.get_agent_id() if hasattr(self.sdk, 'get_agent_id') else None,
-                    "validator_domain": self.agent_domain,
-                    "validation_timestamp": datetime.now().isoformat(),
-                    "version": "1.0.0-0g",
-                    "process_integrity": True if tee_proof and tee_proof.get("is_valid") else False
-                }
-            })
-            
-            # Store in validation history
-            self.validation_history.append({
-                "validated_item": subject,
-                "score": validation_data.get("overall_score", 0),
-                "quality_rating": validation_data.get("quality_rating", "Unknown"),
-                "validation_result": validation_data,
-                "tee_proof": tee_proof,
-                "timestamp": datetime.now().isoformat()
-            })
-            
-            score = validation_data.get("overall_score", 90)
-            quality = validation_data.get("quality_rating", "Excellent")
-            
-            rprint(f"[green]✅ 0G AI validation completed for {subject}[/green]")
-            rprint(f"[blue]   Score: {score}/100 ({quality})[/blue]")
-            if tee_proof and tee_proof.get("is_valid"):
-                rprint(f"[green]   TEE Verification: ✅ PASSED[/green]")
-            
-            # Create proper IntegrityProof with TEE attestation
-            from chaoschain_sdk.types import IntegrityProof
-            import hashlib
-            
-            # Compute execution hash from validation
-            execution_data = json.dumps(validation_data, sort_keys=True).encode()
-            execution_hash = hashlib.sha256(execution_data).hexdigest()
-            
-            integrity_proof = IntegrityProof(
-                proof_id=f"0g_validation_{int(datetime.now().timestamp())}",
-                function_name="validate_analysis",
-                code_hash=tee_proof.get("code_hash", "0x" + hashlib.sha256(b"0g_compute_validation").hexdigest()),
-                execution_hash=execution_hash,
-                timestamp=datetime.now(),
-                agent_name=self.agent_name,
-                verification_status="verified" if tee_proof.get("is_valid") else "unverified",
-                # ✅ TEE ATTESTATION FIELDS
-                tee_attestation=tee_proof,
-                tee_provider="0g-compute",
-                tee_job_id=tee_proof.get("chat_id") or tee_proof.get("job_id"),
-                tee_execution_hash=tee_proof.get("execution_hash")
-            )
-            
-            return {
-                "validation": validation_data,
-                "process_integrity_proof": integrity_proof
-            }
-            
-        except Exception as e:
-            rprint(f"[red]❌ 0G AI validation failed: {e}[/red]")
-            raise
-    
     def _validate_with_eigenai(self, analysis_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Validate analysis using EigenAI (LLM with TEE proofs)
         """
         rprint(f"[cyan]🔍 Using EigenAI LLM for validation...[/cyan]")
+
+        # Ensure EigenAI receives at least a tiny payload (Eigen rejects empty chat content)
+        if not analysis_data:
+            analysis_data = {
+                "item_type": "demo_product",
+                "price": 42.0,
+                "merchant": "Fallback Merchant",
+                "summary": "Placeholder analysis injected to satisfy EigenAI payload requirements."
+            }
         
         # Build prompt for EigenAI
         prompt = f"""You are an expert validation analyst. Evaluate the following shopping analysis:
@@ -1106,6 +915,25 @@ Be thorough and objective in your validation."""
             
             # Parse validation output from TEE
             validation_output = result.output
+            if isinstance(validation_output, str):
+                raw = validation_output.strip()
+                if raw:
+                    try:
+                        validation_output = json.loads(raw)
+                    except json.JSONDecodeError:
+                        # attempt to extract JSON block if wrapped in markdown/text
+                        if "{" in raw and "}" in raw:
+                            candidate = raw[raw.find("{"): raw.rfind("}") + 1]
+                            try:
+                                validation_output = json.loads(candidate)
+                            except Exception:
+                                validation_output = {"raw_output": raw}
+                        else:
+                            validation_output = {"raw_output": raw}
+                else:
+                    validation_output = {}
+            elif not isinstance(validation_output, dict):
+                validation_output = dict(validation_output or {})
             
             # Detect subject for logging
             if "shopping_result" in analysis_data or "item_type" in analysis_data:

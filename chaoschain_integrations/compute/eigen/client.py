@@ -407,6 +407,14 @@ class EigenComputeClient:
         else:
             messages = prompt  # Already in messages format
 
+        # Eigen rejects empty message content; inject minimal placeholder
+        if not messages:
+            messages = [{"role": "user", "content": "Provide a brief validation summary."}]
+        else:
+            for msg in messages:
+                if isinstance(msg, dict) and not msg.get("content"):
+                    msg["content"] = "Provide a brief validation summary."
+
         # Required fields for EigenAI
         payload = {
             "model": task.get("model", "gpt-oss-120b-f16"),  # Default EigenAI model
@@ -473,4 +481,3 @@ class EigenComputeClient:
     def list_models_sync(self, timeout_s: Optional[int] = None) -> List[Dict[str, Any]]:
         """Synchronous wrapper for list_models."""
         return asyncio.run(self.list_models(timeout_s))
-

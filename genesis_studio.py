@@ -1,190 +1,407 @@
 #!/usr/bin/env python3
 """
-CHAOSCHAIN GENESIS STUDIO - x402 Enhanced Commercial Prototype
+CHAOSCHAIN GENESIS STUDIO - Eigen Stack Demonstration
 
-This script demonstrates the complete end-to-end commercial lifecycle of agentic work
-with x402 payment integration:
+This script drives the full Triple-Verified Stack using EigenCompute + EigenAI for
+process integrity, ERC-8004 identity, and Coinbase x402 settlements:
 
-1. On-chain identity registration using ERC-8004
-2. Verifiable work execution with IPFS storage
-3. x402 agent-to-agent payments with cryptographic receipts
-4. Enhanced evidence packages with payment proofs for PoA
-5. Enhanced evidence packages with payment proofs
+1. Register agents on ERC-8004 and link wallets.
+2. Execute EigenCompute-backed workloads with deterministic proofs.
+3. Run Google AP2 intent verification for user authorization.
+4. Perform three Alice ↔ Bob x402 settlements at 0.0001 USDC each.
+5. Build enhanced evidence packages that include Eigen proofs and payment receipts.
 
 Usage:
     python genesis_studio.py
-
-=== PLUGGABLE PROVIDER ARCHITECTURE DEMO ===
-
-The ChaosChain SDK now supports pluggable storage and compute providers.
-This demonstrates how developers can inject custom providers like 0G Storage/Compute:
-
-Example 1: Using 0G Storage via gRPC Sidecar Bridge
-```python
-from chaoschain_sdk import ChaosChainAgentSDK
-
-# Initialize 0G Storage provider via gRPC sidecar
-zg_storage = ZeroGStorageGRPC(
-    grpc_url="localhost:50051",  # 0G bridge gRPC endpoint
-    api_key="your-0g-api-key"
-)
-
-# Inject into SDK
-agent = ChaosChainAgentSDK(
-    agent_name="MyAgent",
-    agent_domain="myagent.example.com",
-    agent_role="server",
-    network="0g-testnet",
-    storage_provider=zg_storage  # ✅ Custom provider injected
-)
-
-# SDK will now use 0G Storage for all evidence packages
-result = zg_storage.put(
-    evidence_bytes,
-    tags={"task": "audit"},
-    idempotency_key="request-123"
-)
-print(f"Stored on 0G: {result.uri}")  # 0g://object/abc123
-```
-
-Example 2: Using 0G Compute via gRPC Sidecar Bridge
-```python
-from chaoschain_sdk import ChaosChainAgentSDK
-
-# Initialize 0G Compute provider via gRPC sidecar
-zg_compute = ZeroGComputeGRPC(
-    grpc_url="localhost:50052",  # 0G compute gRPC endpoint
-    api_key="your-0g-api-key"
-)
-
-# Inject into SDK
-agent = ChaosChainAgentSDK(
-    agent_name="MyAgent",
-    agent_domain="myagent.example.com",
-    agent_role="server",
-    network="0g-testnet",
-    compute_provider=zg_compute  # ✅ Custom compute provider injected
-)
-
-# Submit verifiable compute task
-job_id = zg_compute.submit(
-    task={"model": "llama2", "prompt": "Analyze market data"},
-    verification=ProviderVerificationMethod.TEE_ML
-)
-
-# Wait for completion and get results
-result = zg_compute.wait_for_completion(job_id)
-print(f"Output: {result.output}")
-print(f"Proof: {result.proof}")  # TEE attestation
-```
-
-Example 3: Default Behavior (Auto-detection)
-```python
-# Without provider injection, SDK auto-detects available storage:
-# Pinata (if PINATA_JWT set) → Local IPFS → Memory fallback
-agent = ChaosChainAgentSDK(
-    agent_name="MyAgent",
-    agent_domain="myagent.example.com",
-    agent_role="server",
-    network="base-sepolia"
-    # No provider injection - uses auto-detected storage
-)
-```
-
-Example 4: ERC-8004 v1.0 Feedback with Payment Proof
-```python
-from chaoschain_sdk import ChaosChainAgentSDK
-from chaoschain_sdk.types import PaymentProof
-
-# Execute payment (x402)
-payment_proof = sdk.x402_manager.execute_agent_payment(
-    from_agent="Alice",
-    to_agent="Bob",
-    amount_usdc=10.0,
-    service_description="Data analysis task"
-)
-
-# Generate feedback authorization
-feedback_auth = sdk.chaos_agent.generate_feedback_authorization(
-    agent_id=server_agent_id,
-    client_address=client_wallet_address,
-    index_limit=1,
-    expiry=int(time.time()) + 3600
-)
-
-# Create ERC-8004 v1.0 compliant feedback with payment proof
-# This automatically:
-# 1. Formats feedback JSON per ERC-8004 v1.0 spec
-# 2. Includes payment proof (fromAddress, toAddress, chainId, txHash)
-# 3. Uploads to IPFS/0G Storage
-# 4. Returns (URI, hash) ready for on-chain submission
-uri, hash = sdk.chaos_agent.create_feedback_with_payment(
-    agent_id=server_agent_id,
-    score=100,
-    feedback_auth=feedback_auth,
-    payment_proof=payment_proof,  # ✅ Automatically ERC-8004 v1.0 compliant!
-    skill="data-analysis",
-    task="market-research",
-    tag1="quality",
-    tag2="speed"
-)
-
-# Submit feedback to on-chain reputation registry
-tx_hash = sdk.chaos_agent.give_feedback(
-    agent_id=server_agent_id,
-    score=100,
-    feedback_auth=feedback_auth,
-    file_uri=uri,  # URI with payment proof included
-    file_hash=hash
-)
-
-print(f"✅ Feedback with payment proof submitted: {tx_hash}")
-```
 """
 
 import os
 import sys
 import json
 import time
-from datetime import datetime
-from typing import Dict, Any, Optional
+import threading
+import hashlib
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional, List
+from rich.console import Console, Group
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from rich.panel import Panel
+from types import SimpleNamespace
 
 # Add integrations to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "chaoschain-integrations"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "chaoschain_integrations"))
 
 from dotenv import load_dotenv
-from rich import print as rprint
-from rich.panel import Panel
+from rich import print as rich_print
 from rich.align import Align
 from rich.table import Table
 from chaoschain_sdk import ChaosChainAgentSDK, NetworkConfig
-from chaoschain_sdk.types import AgentRole
+from chaoschain_sdk.types import AgentRole, PaymentMethod, PaymentProof
+from chaoschain_sdk.exceptions import PaymentError
+from web3.exceptions import TimeExhausted
 
 # Import agents
 from agents.server_agent_sdk import GenesisServerAgentSDK
 from agents.validator_agent_sdk import GenesisValidatorAgentSDK
 from agents.client_agent_genesis import GenesisClientAgent
 
+
+DEBUG_MODE = os.getenv("GENESIS_DEBUG", "0").lower() in ("1", "true", "yes")
+MINIMAL_OUTPUT = False if DEBUG_MODE else os.getenv("GENESIS_MINIMAL_OUTPUT", "1").lower() in ("1", "true", "yes")
+ERROR_TOKENS = ("[red]", "❌", "⚠️", "[bold red]")
+
+def rprint(*args, **kwargs):
+    """Print helper that suppresses non-essential logs when minimal mode is enabled."""
+    if not args:
+        return
+    first = args[0]
+    if isinstance(first, str) and "0g" in first.lower():
+        return
+
+    # Remove all yellow logs unless debug mode is explicitly enabled
+    if not DEBUG_MODE and isinstance(first, str) and "[yellow]" in first:
+        return
+    
+    if MINIMAL_OUTPUT and not DEBUG_MODE:
+        if isinstance(first, str) and not any(token in first for token in ERROR_TOKENS):
+            return
+    return rich_print(*args, **kwargs)
+
 # Load environment variables
 load_dotenv()
 
-# Fix hyphenated env vars for SDK compatibility
-# SDK expects hyphenated versions (e.g., 0G-TESTNET_RPC_URL) but we use underscores in .env
-if os.getenv("ZEROG_TESTNET_RPC_URL") and not os.getenv("0G-TESTNET_RPC_URL"):
-    os.environ["0G-TESTNET_RPC_URL"] = os.environ["ZEROG_TESTNET_RPC_URL"]
-if os.getenv("ZEROG_TESTNET_PRIVATE_KEY") and not os.getenv("0G-TESTNET_PRIVATE_KEY"):
-    os.environ["0G-TESTNET_PRIVATE_KEY"] = os.environ["ZEROG_TESTNET_PRIVATE_KEY"]
-if os.getenv("ZEROG_TESTNET_CHAIN_ID") and not os.getenv("0G-TESTNET_CHAIN_ID"):
-    os.environ["0G-TESTNET_CHAIN_ID"] = os.environ["ZEROG_TESTNET_CHAIN_ID"]
+# Normalize Ethereum Sepolia environment variables (hyphenated vs underscored)
+if os.getenv("ETHEREUM_SEPOLIA_RPC_URL") and not os.getenv("ETHEREUM-SEPOLIA_RPC_URL"):
+    os.environ["ETHEREUM-SEPOLIA_RPC_URL"] = os.environ["ETHEREUM_SEPOLIA_RPC_URL"]
+if os.getenv("ETHEREUM_SEPOLIA_PRIVATE_KEY") and not os.getenv("ETHEREUM-SEPOLIA_PRIVATE_KEY"):
+    os.environ["ETHEREUM-SEPOLIA_PRIVATE_KEY"] = os.environ["ETHEREUM_SEPOLIA_PRIVATE_KEY"]
 
-# Set defaults if not provided
-if not os.getenv("0G-TESTNET_RPC_URL"):
-    os.environ["0G-TESTNET_RPC_URL"] = "https://evmrpc-testnet.0g.ai"
-    print("✅ Using default 0G Testnet RPC: https://evmrpc-testnet.0g.ai")
-if not os.getenv("0G-TESTNET_CHAIN_ID"):
-    os.environ["0G-TESTNET_CHAIN_ID"] = "16600"
-    print("✅ Using default 0G Testnet Chain ID: 16600")
+# Normalize standard Sepolia environment variable names
+if os.getenv("SEPOLIA_RPC_URL") and not os.getenv("ETHEREUM_SEPOLIA_RPC_URL"):
+    os.environ["ETHEREUM_SEPOLIA_RPC_URL"] = os.environ["SEPOLIA_RPC_URL"]
+if os.getenv("ETHEREUM_SEPOLIA_RPC_URL") and not os.getenv("SEPOLIA_RPC_URL"):
+    os.environ["SEPOLIA_RPC_URL"] = os.environ["ETHEREUM_SEPOLIA_RPC_URL"]
+if os.getenv("SEPOLIA_PRIVATE_KEY") and not os.getenv("ETHEREUM_SEPOLIA_PRIVATE_KEY"):
+    os.environ["ETHEREUM_SEPOLIA_PRIVATE_KEY"] = os.environ["SEPOLIA_PRIVATE_KEY"]
+if os.getenv("ETHEREUM_SEPOLIA_PRIVATE_KEY") and not os.getenv("SEPOLIA_PRIVATE_KEY"):
+    os.environ["SEPOLIA_PRIVATE_KEY"] = os.environ["ETHEREUM_SEPOLIA_PRIVATE_KEY"]
+
+NETWORK_PROFILES = {
+    "ethereum-sepolia": {
+        "display_name": "Ethereum Sepolia",
+        "explorer_base": "https://sepolia.etherscan.io/tx/",
+        "payment_token_symbol": "USDC",
+        "native_token_symbol": "ETH",
+        "faucet_url": "https://www.alchemy.com/sepolia-faucet",
+        "analysis_payment_amount": 0.0001,
+        "validation_payment_amount": 0.0001,
+        "payment_currency_label": "USDC (Ethereum Sepolia)",
+        "protocol_description": "Production-ready USDC settlement on Ethereum Sepolia",
+        "gas_recommendation": "Each wallet needs ~0.05 ETH for gas fees",
+        "network_summary_label": "Ethereum Sepolia",
+        "supports_x402": True
+    },
+}
+
+class WaitBar:
+    """Display a pulsing spinner + progress bar for a running step."""
+
+    def __init__(self, console: Console, description: str, *, bar_width: int = 68, show_completion: bool = False):
+        self.console = console
+        self.description = description
+        self.bar_width = bar_width
+        self.show_completion = show_completion
+        self.elapsed: Optional[float] = None
+        self._stop_event = threading.Event()
+        self._start: Optional[float] = None
+        self._progress: Optional[Progress] = None
+        self._task_id: Optional[int] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def __enter__(self):
+        self._progress = Progress(
+            SpinnerColumn(style="cyan"),
+            TextColumn("[bold white]{task.description}", justify="left"),
+            BarColumn(
+                bar_width=self.bar_width,
+                complete_style="green",
+                finished_style="green",
+                pulse_style="cyan",
+            ),
+            TimeElapsedColumn(),
+            console=self.console,
+            transient=True,
+        )
+
+        def runner():
+            with self._progress:
+                self._task_id = self._progress.add_task(self.description, total=100)
+                progress_value = 0
+                while not self._stop_event.is_set():
+                    if self._task_id is not None:
+                        progress_value = (progress_value + 3) % 100
+                        self._progress.update(self._task_id, completed=progress_value)
+                    time.sleep(0.08)
+
+        self._thread = threading.Thread(target=runner, daemon=True)
+        self._thread.start()
+        self._start = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._start is None:
+            self.elapsed = 0.0
+        else:
+            self.elapsed = time.perf_counter() - self._start
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join()
+
+        if self.show_completion:
+            if exc_type is None:
+                self.console.print(f"[green]✅ {self.description} completed in {self.elapsed:.2f}s[/green]")
+            else:
+                self.console.print(f"[red]❌ {self.description} failed after {self.elapsed:.2f}s[/red]")
+        return False
+
+
+@dataclass
+class StepRecord:
+    name: str
+    reference: str
+    latency: float
+    tx_hash: Optional[str] = None
+    gas_fee: Optional[float] = None
+
+
+@dataclass
+class TransactionRecord:
+    label: str
+    tx_hash: str
+    latency: float
+    gas_fee: Optional[float] = None
+
+
+class StepRuntime:
+    """Context manager to drive wait bars + capture metadata per step."""
+
+    def __init__(
+        self,
+        manager: "StepProgressManager",
+        title: str,
+        reference_hint: Optional[str],
+        step_number: int
+    ):
+        self.manager = manager
+        self.title = title
+        self.reference_hint = reference_hint
+        self.reference: Optional[str] = None
+        self.wait_bar: Optional[WaitBar] = None
+        self._start: Optional[float] = None
+        self.tx_hash: Optional[str] = None
+        self.tx_latency: Optional[float] = None
+        self.gas_fee_total: float = 0.0
+        self._has_gas_data = False
+        self.step_number = step_number
+        self.notes: List[str] = []
+
+    def __enter__(self):
+        self.wait_bar = WaitBar(self.manager.console, self.title, show_completion=False)
+        self.wait_bar.__enter__()
+        self._start = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.wait_bar:
+            self.wait_bar.__exit__(exc_type, exc, tb)
+        elapsed = time.perf_counter() - self._start if self._start else 0.0
+        reference = self.reference or self.reference_hint or "N/A"
+        status_text = "[green]✅ Completed[/green]"
+        border_style = "green"
+        extra_lines: List[str] = []
+
+        if exc_type is None:
+            gas_fee_value = self.gas_fee_total if self._has_gas_data else None
+            self.manager.add_step_record(
+                StepRecord(
+                    name=self.title,
+                    reference=reference,
+                    latency=elapsed,
+                    tx_hash=self.tx_hash,
+                    gas_fee=gas_fee_value
+                )
+            )
+        else:
+            status_text = "[red]❌ Failed[/red]"
+            border_style = "red"
+            extra_lines.append(f"[red]Reason: {exc_type.__name__}[/red]")
+
+        if self.tx_hash:
+            extra_lines.append(f"[cyan]Tx:[/cyan] {self.manager.shorten(self.tx_hash)}")
+        if self.notes:
+            extra_lines.extend(self.notes)
+
+        body_lines = [
+            status_text,
+            f"[white]Reference:[/white] {reference}",
+            f"[white]Duration:[/white] {elapsed:.2f}s",
+        ] + extra_lines
+
+        clean_title = self.title
+        if clean_title.lower().startswith("step"):
+            parts = clean_title.split(":", 1)
+            if len(parts) == 2 and parts[1].strip():
+                clean_title = parts[1].strip()
+
+        panel = Panel(
+            "\n".join(body_lines),
+            title=f"[bold]Step {self.step_number}: {clean_title}[/bold]",
+            border_style=border_style,
+            padding=(1, 2)
+        )
+        self.manager.console.print(panel)
+        return False
+
+    def set_reference(self, reference: Optional[str]):
+        if reference:
+            self.reference = reference
+
+    def record_transaction(self, label: str, tx_hash: Optional[str], *, latency: Optional[float] = None, w3=None):
+        if not tx_hash:
+            return
+        gas_fee = self._estimate_gas_fee(w3, tx_hash)
+        txn_latency = latency if latency is not None else (time.perf_counter() - self._start if self._start else 0.0)
+        self.manager.transactions.append(
+            TransactionRecord(
+                label=label,
+                tx_hash=tx_hash,
+                latency=txn_latency,
+                gas_fee=gas_fee
+            )
+        )
+        self.tx_hash = tx_hash
+        if gas_fee is not None:
+            self.gas_fee_total += gas_fee
+            self._has_gas_data = True
+        if not self.reference:
+            self.reference = tx_hash
+
+    def add_note(self, note: str):
+        self.notes.append(note)
+
+    @staticmethod
+    def _estimate_gas_fee(w3, tx_hash: str) -> Optional[float]:
+        if not w3 or not tx_hash or not tx_hash.startswith("0x"):
+            return None
+        try:
+            receipt = w3.eth.get_transaction_receipt(tx_hash)
+            gas_used = receipt.get("gasUsed")
+            if gas_used is None:
+                return None
+            tx = w3.eth.get_transaction(tx_hash)
+            gas_price = (
+                tx.get("effectiveGasPrice")
+                or tx.get("gasPrice")
+                or tx.get("maxFeePerGas")
+            )
+            if gas_price is None:
+                return None
+            return float(w3.from_wei(gas_used * gas_price, "ether"))
+        except Exception:
+            return None
+
+
+class StepProgressManager:
+    """Aggregate per-step metrics for final reporting."""
+
+    def __init__(self, console: Console):
+        self.console = console
+        self.steps: List[StepRecord] = []
+        self.transactions: List[TransactionRecord] = []
+        self._step_counter = 0
+
+    def step(self, title: str, *, reference_hint: Optional[str] = None) -> StepRuntime:
+        self._step_counter += 1
+        return StepRuntime(self, title, reference_hint, self._step_counter)
+
+    def add_step_record(self, record: StepRecord):
+        self.steps.append(record)
+
+    def render_summary(self, total_runtime: float):
+        if not self.steps:
+            return
+
+        step_table = Table(title="Step Timeline", header_style="bold cyan")
+        step_table.add_column("Step", justify="left")
+        step_table.add_column("Latency", justify="right")
+        step_table.add_column("Reference / ID", justify="left")
+        step_table.add_column("Tx Hash", justify="left")
+        for entry in self.steps:
+            step_table.add_row(
+                entry.name,
+                f"{entry.latency:.2f}s",
+                self._shorten(entry.reference),
+                self._shorten(entry.tx_hash)
+            )
+
+        tx_table = Table(title="Transaction Ledger", header_style="bold cyan")
+        tx_table.add_column("Action", justify="left")
+        tx_table.add_column("Tx Hash", justify="left")
+        tx_table.add_column("Latency", justify="right")
+        tx_table.add_column("Gas Fee", justify="right")
+        if self.transactions:
+            for tx in self.transactions:
+                tx_table.add_row(
+                    tx.label,
+                    self._shorten(tx.tx_hash),
+                    f"{tx.latency:.2f}s",
+                    f"{tx.gas_fee:.6f} ETH" if tx.gas_fee is not None else "N/A"
+                )
+        else:
+            tx_table.add_row("—", "No blockchain transactions recorded", "—", "—")
+
+        total_step_latency = sum(entry.latency for entry in self.steps)
+        total_gas_fee = sum(
+            tx.gas_fee for tx in self.transactions if tx.gas_fee is not None
+        )
+        metrics_table = Table.grid(padding=(0, 2))
+        metrics_table.add_column(style="cyan", justify="right")
+        metrics_table.add_column(style="white")
+        metrics_table.add_row("Total Runtime", f"{total_runtime:.2f}s")
+        metrics_table.add_row("Sum Step Latency", f"{total_step_latency:.2f}s")
+        metrics_table.add_row(
+            "Tx Gas Fees",
+            f"{total_gas_fee:.6f} ETH" if total_gas_fee else "N/A"
+        )
+
+        summary_panel = Panel(
+            Group(step_table, tx_table, metrics_table),
+            title="⏱️ Execution Metrics",
+            border_style="green",
+        )
+        self.console.print(summary_panel)
+
+    @staticmethod
+    def _shorten(value: Optional[str], limit: int = 32) -> str:
+        return value or "N/A"
+
+    def shorten(self, value: Optional[str], limit: int = 32) -> str:
+        return self._shorten(value, limit)
+
+
+ERC20_TRANSFER_ABI = [
+    {
+        "constant": False,
+        "inputs": [
+            {"name": "_to", "type": "address"},
+            {"name": "_value", "type": "uint256"}
+        ],
+        "name": "transfer",
+        "outputs": [{"name": "", "type": "bool"}],
+        "type": "function"
+    }
+]
 
 class GenesisStudioX402Orchestrator:
     """Enhanced Genesis Studio orchestrator with x402 payment integration"""
@@ -192,16 +409,95 @@ class GenesisStudioX402Orchestrator:
     def __init__(self):
         # Track results for final summary
         self.results = {}
+        self.console = Console()
+        self.step_progress = StepProgressManager(self.console)
+        self._demo_start: Optional[float] = None
+        self.charlie_enabled = os.getenv("GENESIS_ENABLE_CHARLIE", "0").lower() in ("1", "true", "yes")
         
         # Agent SDK instances
         self.alice_sdk = None  # Server Agent
         self.bob_sdk = None    # Validator Agent
         self.charlie_sdk = None # Client Agent
+        
+        # Network + payment context
+        self.network_name = os.getenv("NETWORK", "ethereum-sepolia")
+        os.environ["NETWORK"] = self.network_name  # Ensure downstream SDKs see the resolved value
+        self.network_profile = self._get_network_profile(self.network_name)
+        self.payment_token_symbol = self.network_profile["payment_token_symbol"]
+        self.native_token_symbol = self.network_profile["native_token_symbol"]
+        self.explorer_base = self.network_profile["explorer_base"]
+        self.supports_x402 = self.network_profile.get("supports_x402", True)
+
+    @staticmethod
+    def _extract_job_id_from_metadata(summary: Dict[str, Any], tee_exec_meta: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Infer a job identifier from available Eigen metadata."""
+        metadata = summary.get("metadata") if isinstance(summary.get("metadata"), dict) else {}
+        if not isinstance(summary.get("metadata"), dict):
+            summary["metadata"] = metadata
+        full_response = metadata.get("full_response") if isinstance(metadata.get("full_response"), dict) else {}
+        candidates = [
+            summary.get("job_id"),
+            summary.get("tee_job_id"),
+            tee_exec_meta.get("eigenai_job_id") if tee_exec_meta else None,
+            tee_exec_meta.get("job_id") if tee_exec_meta else None,
+            metadata.get("job_id"),
+            metadata.get("id"),
+            full_response.get("id"),
+            summary.get("proof_id")
+        ]
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate
+        return None
+
+    def _normalize_process_proof(
+        self,
+        process_proof: Optional[Any],
+        *,
+        exec_hash: Optional[str],
+        tee_exec_meta: Optional[Dict[str, Any]],
+        fallback_reason: str
+    ) -> Optional[Dict[str, Any]]:
+        """Normalize a process proof into a dict and ensure job identifiers exist."""
+        if not process_proof:
+            self.results["process_integrity_error"] = fallback_reason
+            rprint(f"[yellow]⚠️  {fallback_reason}[/yellow]")
+            return None
+
+        if hasattr(process_proof, "__dict__"):
+            summary_proof = dict(process_proof.__dict__)
+        elif isinstance(process_proof, dict):
+            summary_proof = dict(process_proof)
+        else:
+            summary_proof = {"value": process_proof}
+
+        job_id = self._extract_job_id_from_metadata(summary_proof, tee_exec_meta)
+        summary_proof["job_id"] = job_id or "unavailable"
+
+        if exec_hash and not summary_proof.get("execution_hash"):
+            summary_proof["execution_hash"] = exec_hash
+
+        if summary_proof["job_id"] == "unavailable":
+            meta_snapshot = tee_exec_meta or summary_proof.get("metadata") or {}
+            error_msg = f"Eigen process proof missing job_id (metadata snapshot: {meta_snapshot})"
+            self.results["process_integrity_error"] = error_msg
+            rprint(f"[yellow]⚠️  {error_msg}[/yellow]")
+        else:
+            self.results.pop("process_integrity_error", None)
+        return summary_proof
+    
+    def _get_network_profile(self, network_name: str) -> Dict[str, Any]:
+        """Return presentation + payment config for the active network."""
+        if network_name not in NETWORK_PROFILES:
+            rprint(f"[yellow]⚠️  No custom profile for '{network_name}', defaulting to Ethereum Sepolia settings[/yellow]")
+            return NETWORK_PROFILES["ethereum-sepolia"]
+        return NETWORK_PROFILES[network_name]
     
     def run_complete_demo(self):
         """Execute the complete Genesis Studio x402 demonstration"""
         
         try:
+            self._demo_start = time.perf_counter()
             self._print_banner()
             
             # Phase 1: Setup & On-Chain Identity
@@ -235,7 +531,7 @@ class GenesisStudioX402Orchestrator:
 
 [yellow] Triple-Verified Stack:[/yellow]
 • Layer 1: AP2 Intent Verification (Google)
-• Layer 2: Process Integrity (ChaosChain + EigenCompute or 0G Compute)
+• Layer 2: Process Integrity (ChaosChain + EigenCompute)
 • Layer 3: Adjudication/Accountability (ChaosChain)
 
 [green]🔗 ChaosChain owns 2/3 layers![/green]
@@ -260,35 +556,52 @@ class GenesisStudioX402Orchestrator:
         
         # Step 1: Configuration Check
         rprint("\n[blue]🔧 Step 1: Validating x402 and ERC-8004 configuration...[/blue]")
-        self._validate_configuration()
-        rprint("[green]✅ Configuration validated[/green]")
+        with self.step_progress.step("Step 1: Validate configuration", reference_hint=self.network_name) as step:
+            config_meta = self._validate_configuration()
+            step.set_reference(config_meta.get("config_id", self.network_name))
         
         # Step 2: Initialize Agent SDKs with x402 Integration
         rprint("\n[blue]🔧 Step 2: Initializing ChaosChain Agent SDKs with x402 payment support...[/blue]")
-        self._initialize_agent_sdks()
-        rprint("[green]✅ Agent SDKs initialized[/green]")
+        with self.step_progress.step("Step 2: Initialize ChaosChain Agent SDKs") as step:
+            agent_meta = self._initialize_agent_sdks()
+            alice_wallet = agent_meta.get("wallets", {}).get("Alice")
+            if alice_wallet:
+                step.set_reference(f"Alice:{alice_wallet[-6:]}")
+            else:
+                step.set_reference("SDK_INIT")
         
         # Step 3: Fund wallets from faucet
-        rprint("\n[blue]🔧 Step 3: Funding wallets from Base Sepolia faucet...[/blue]")
-        self._fund_agent_wallets()
-        rprint("[green]✅ Wallets funded[/green]")
+        rprint(f"\n[blue]🔧 Step 3: Funding wallets on {self.network_profile['display_name']}...[/blue]")
+        with self.step_progress.step("Step 3: Verify wallet funding") as step:
+            funding_meta = self._fund_agent_wallets()
+            funded_agents = funding_meta.get("funded_agents", [])
+            step.set_reference(",".join(funded_agents) if funded_agents else "manual_funding")
         
         # Step 4: On-chain registration
         rprint("\n[blue]🔧 Step 4: Registering agents on ERC-8004 IdentityRegistry...[/blue]")
-        self._register_agents_onchain()
-        rprint("[green]✅ Agents registered on-chain[/green]")
+        with self.step_progress.step("Step 4: Register CrewAI agents", reference_hint="registration") as step:
+            registration_results = self._register_agents_onchain()
+            agent_ids = [
+                str(data.get("agent_id"))
+                for data in registration_results.get("agents", {}).values()
+                if data.get("agent_id") is not None
+            ]
+            step.set_reference("IDs:" + ",".join(agent_ids) if agent_ids else "registration_skipped")
     
     def _phase_2_x402_work_and_payment(self):
         """Phase 2: Triple-Verified Stack Work & Payment"""
         
         rprint("\n[bold blue]📋 Phase 2: Triple-Verified Stack Work & Payment[/bold blue]")
-        rprint("[cyan]Alice evaluates micro-loan with AP2 intent verification, ChaosChain process integrity (EigenCompute TEE), and x402 payments (A0GI)[/cyan]")
+        rprint(f"[cyan]Alice evaluates micro-loan with AP2 intent verification, ChaosChain process integrity (EigenCompute TEE), and x402 payments ({self.payment_token_symbol})[/cyan]")
         rprint("=" * 80)
         
         # Step 5: AP2 Intent Verification
         rprint("\n[blue]🔧 Step 5: Creating AP2 intent mandate for loan request...[/blue]")
-        intent_mandate = self._create_ap2_intent_mandate()
-        rprint("[green]✅ AP2 intent mandate created and verified[/green]")
+        with self.step_progress.step("Step 5: Create AP2 intent mandate") as step:
+            intent_mandate = self._create_ap2_intent_mandate()
+            intent_obj = intent_mandate.get("intent_mandate") if isinstance(intent_mandate, dict) else intent_mandate
+            intent_id = getattr(intent_obj, "intent_id", None) if intent_obj else None
+            step.set_reference(intent_id or "intent_simulated")
         
         # Step 6: Work Execution with Process Integrity (Alice)
         rprint("\n[blue]🔧 Step 6: Alice evaluating loan request with ChaosChain Process Integrity...[/blue]")
@@ -297,28 +610,53 @@ class GenesisStudioX402Orchestrator:
         intent_id = getattr(intent_obj, "intent_id", None) if intent_obj else None
         if intent_id:
             rprint(f"[cyan]🔗 Linking execution to AP2 Intent: {intent_id}[/cyan]")
-        analysis_data, process_integrity_proof, proof_cid, exec_hash = self._execute_smart_shopping_with_integrity(intent_id=intent_id)
-        rprint("[green]✅ Smart shopping completed with process integrity proof[/green]")
+        with self.step_progress.step("Step 6: Execute loan evaluation", reference_hint="analysis") as step:
+            analysis_data, process_integrity_proof, proof_cid, exec_hash = self._execute_smart_shopping_with_integrity(intent_id=intent_id)
+            if exec_hash:
+                step.set_reference(f"exec:{exec_hash}")
+            elif proof_cid:
+                step.set_reference(f"proof:{proof_cid}")
         
-        # Step 7: Evidence Storage (Alice) - Using 0G Storage
-        rprint("\n[blue]🔧 Step 7: Storing analysis on 0G Storage...[/blue]")
-        analysis_cid = self._store_analysis_on_0g_storage(analysis_data, process_integrity_proof)
-        rprint("[green]✅ Analysis stored on 0G Storage[/green]")
+        # Step 7: Evidence Storage (Alice)
+        rprint("\n[blue]🔧 Step 7: Persisting analysis evidence via ChaosChain storage...[/blue]")
+        with self.step_progress.step("Step 7: Persist analysis package") as step:
+            analysis_cid = self._store_analysis_evidence(analysis_data, process_integrity_proof)
+            step.set_reference(analysis_cid or "in-memory")
+            storage_tx = self.results.get("storage_analysis", {}).get("tx_hash")
+            if storage_tx:
+                step.record_transaction("Analysis evidence storage", storage_tx)
         
-        # Step 8: 0G Token Payment (A0GI) with AP2 authorization + ProcessProof CID
-        rprint("\n[blue]🔧 Step 8: Processing 0G token payment with AP2 authorization (A0GI)...[/blue]")
-        payment_results = self._execute_0g_token_payment(analysis_cid, analysis_data, intent_mandate, proof_cid, exec_hash)
-        rprint(f"[green]✅ Payment completed: {payment_results['amount']:.4f} A0GI (Charlie → Alice)[/green]")
+        # Step 8: x402 Settlements between Alice and Bob
+        rprint(f"\n[blue]🔧 Step 8: Executing three Alice ↔ Bob x402 settlements ({self.payment_token_symbol})...[/blue]")
+        with self.step_progress.step("Step 8: Alice ↔ Bob settlements") as step:
+            payment_results = self._execute_alice_bob_payment_series("Eigen loan workflow settlement")
+            successful_txs = [entry["tx_hash"] for entry in payment_results.get("runs", []) if entry.get("tx_hash")]
+            reference_value = successful_txs[-1] if successful_txs else f"{payment_results.get('successes', 0)}/3 settlements"
+            step.set_reference(reference_value)
+            w3 = self.alice_sdk.wallet_manager.w3 if self.alice_sdk else None
+            for tx in payment_results.get("transactions", []):
+                step.record_transaction(tx["label"], tx["tx_hash"], w3=w3)
         
-        # Step 6: Validation Request (Alice → Bob)
-        rprint("\n[blue]🔧 Step 6: Alice requesting validation from Bob...[/blue]")
-        rprint("[green]✅ Validation requested[/green]")
+        # Step 9: Validation Request (Alice → Bob)
+        rprint("\n[blue]🔧 Step 9: Alice requesting validation from Bob...[/blue]")
+        with self.step_progress.step("Step 9: Submit ERC-8004 validation request") as step:
+            validation_request_tx = self._request_validation_erc8004(analysis_cid, analysis_data)
+            step.set_reference(validation_request_tx or "validation_simulated")
+            if validation_request_tx and validation_request_tx.startswith("0x") and self.alice_sdk:
+                step.record_transaction(
+                    "ERC-8004 validation request",
+                    validation_request_tx,
+                    w3=self.alice_sdk.wallet_manager.w3
+                )
         
-        # Step 7: Validation & Payment (Bob) with deterministic comparison
-        rprint("\n[blue]🔧 Step 7: Bob validating with 0G Compute and payment...[/blue]")
+        # Step 10: Validation & Payment (Bob) with deterministic comparison
+        rprint("\n[blue]🔧 Step 10: Bob validating with Eigen stack and settlement receipts...[/blue]")
         
         # Pass original inputs for deterministic re-run
-        charlie_address = self.charlie_agent.wallet.address if hasattr(self.charlie_agent, 'wallet') else "0xCharlie"
+        if self.charlie_agent and hasattr(self.charlie_agent, 'wallet'):
+            charlie_address = self.charlie_agent.wallet.address
+        else:
+            charlie_address = "0xBorrowerDeactivated"
         original_inputs = {
             "borrower_address": charlie_address,
             "loan_amount": 0.5,
@@ -328,12 +666,19 @@ class GenesisStudioX402Orchestrator:
             "previous_defaults": 0
         }
         
-        validation_score, validation_result = self._perform_validation_with_eigencompute(
-            analysis_data, 
-            alice_exec_hash=exec_hash,
-            original_inputs=original_inputs
-        )
-        rprint(f"[green]✅ Validation completed (Score: {validation_score}/100)[/green]")
+        with self.step_progress.step("Step 10: Bob validation + payout") as step:
+            validation_score, validation_result = self._perform_validation_with_eigencompute(
+                analysis_data, 
+                alice_exec_hash=exec_hash,
+                original_inputs=original_inputs,
+                analysis_cid=analysis_cid
+            )
+            step.set_reference(f"score:{validation_score}")
+            validation_payment = self.results.get("validation", {}).get("x402_payment")
+            if validation_payment and getattr(validation_payment, "transaction_hash", None):
+                val_tx_hash = validation_payment.transaction_hash
+                w3 = self.alice_sdk.wallet_manager.w3 if self.alice_sdk else None
+                step.record_transaction("Validation settlement", val_tx_hash, w3=w3)
     
     def _phase_3_enhanced_evidence_packages(self):
         """Phase 3: Enhanced Evidence Packages with Payment Proofs"""
@@ -344,24 +689,38 @@ class GenesisStudioX402Orchestrator:
         
         # Step 11: Create Enhanced Evidence Package (Alice)
         rprint("\n[blue]🔧 Step 11: Alice creating enhanced evidence package with payment proofs...[/blue]")
-        alice_evidence_package = self._create_enhanced_evidence_package()
-        rprint("[green]✅ Enhanced evidence package created[/green]")
+        with self.step_progress.step("Step 11: Build enhanced evidence package") as step:
+            alice_evidence_package = self._create_enhanced_evidence_package()
+            payment_proofs = len(alice_evidence_package.get("payment_proofs", []))
+            step.set_reference(f"proofs:{payment_proofs}")
         
-        # Step 12: Store Enhanced Evidence Package on 0G Storage
-        rprint("\n[blue]🔧 Step 12: Storing enhanced evidence package on 0G Storage...[/blue]")
-        enhanced_evidence_cid = self._store_enhanced_evidence_package(alice_evidence_package)
-        rprint("[green]✅ Enhanced evidence package stored[/green]")
+        # Step 12: Store Enhanced Evidence Package
+        rprint("\n[blue]🔧 Step 12: Storing enhanced evidence package via ChaosChain storage...[/blue]")
+        with self.step_progress.step("Step 12: Persist enhanced evidence package") as step:
+            enhanced_evidence_cid = self._store_enhanced_evidence_package(alice_evidence_package)
+            step.set_reference(enhanced_evidence_cid or "memory_fallback")
+            storage_tx = self.results.get("enhanced_evidence", {}).get("tx_hash")
+            if storage_tx:
+                w3 = self.alice_sdk.wallet_manager.w3 if self.alice_sdk else None
+                step.record_transaction("Enhanced evidence storage", storage_tx, w3=w3)
     
     
     def _validate_configuration(self):
         """Validate all required environment variables including x402"""
-        network = os.getenv("NETWORK", "base-sepolia")
+        network = self.network_name
         
         # Core required variables (network-specific)
         if network == "0g-testnet":
             required_vars = [
                 "NETWORK", "ZEROG_TESTNET_RPC_URL", "ZEROG_TESTNET_PRIVATE_KEY"
             ]
+        elif network == "ethereum-sepolia":
+            required_vars = [
+                "NETWORK", "SEPOLIA_RPC_URL"
+            ]
+            # Accept either explicit Sepolia key env or wallet file
+            if not os.path.exists("chaoschain_wallets.json"):
+                required_vars.append("SEPOLIA_PRIVATE_KEY")
         elif network == "base-sepolia":
             required_vars = [
                 "NETWORK", "BASE_SEPOLIA_RPC_URL", "BASE_SEPOLIA_PRIVATE_KEY"
@@ -395,9 +754,17 @@ class GenesisStudioX402Orchestrator:
             rprint("[yellow]   Storage will use local IPFS fallback (free option)[/yellow]")
             rprint("[yellow]   To enable Pinata: set PINATA_JWT and PINATA_GATEWAY[/yellow]")
         
-        # Validate network is set to 0g-testnet
-        if os.getenv("NETWORK") != "0g-testnet":
-            rprint("[yellow]⚠️  Network is not set to '0g-testnet'. This demo is designed for 0G Testnet.[/yellow]")
+        # Display active network
+        rprint(f"[cyan]🌐 Active network: {self.network_profile['display_name']} ({network})[/cyan]")
+        
+        config_signature = hashlib.sha256(
+            f"{network}:{','.join(sorted(required_vars))}:{','.join(sorted(optional_vars))}".encode()
+        ).hexdigest()
+        return {
+            "network": network,
+            "config_id": f"CFG-{config_signature.upper()}",
+            "missing_optional": missing_optional
+        }
     
     def _initialize_agent_sdks(self):
         """Initialize CrewAI-powered agents with ChaosChain SDK integration"""
@@ -405,67 +772,26 @@ class GenesisStudioX402Orchestrator:
         # Create CrewAI-powered agents with ChaosChain SDK integration
         rprint("[yellow]🤖 Initializing CrewAI-powered agents with ChaosChain SDK...[/yellow]")
         
-        # Read compute provider from environment
-        compute_provider = os.getenv("COMPUTE_PROVIDER", "0g").lower()
+        # Determine compute providers (prefer Eigen by default)
+        eigen_api_key = os.getenv("EIGEN_API_KEY")
+        compute_provider_env = os.getenv("COMPUTE_PROVIDER")
+        preferred_provider = compute_provider_env.lower() if compute_provider_env else "eigencompute"
+        alice_compute_provider = preferred_provider
+        bob_compute_provider = "eigenai" if eigen_api_key else preferred_provider
+        if not compute_provider_env and not eigen_api_key:
+            rprint("[cyan]🧠 Defaulting to EigenCompute sidecar for Alice[/cyan]")
+        if eigen_api_key and bob_compute_provider == "eigenai":
+            rprint("[cyan]🧠 Eigen API key detected – Bob will use EigenAI[/cyan]")
+        self.compute_provider_name = alice_compute_provider
+        rprint(f"[bold green]🔧 Active Compute Providers — Alice: {alice_compute_provider.upper()}, Bob: {bob_compute_provider.upper()}[/bold green]")
         
-        # Display chosen provider
-        if compute_provider == "eigenai":
-            rprint("[cyan]🔧 Using EigenAI (TEE-verified LLM)[/cyan]")
-        elif compute_provider == "eigencompute":
-            rprint("[cyan]🔧 Using EigenCompute (TEE agent deployment)[/cyan]")
-        elif compute_provider == "0g":
-            rprint("[cyan]🔧 Using 0G Compute (decentralized LLM)[/cyan]")
-        else:
-            rprint("[cyan]🔧 Using CrewAI (local processing)[/cyan]")
-        
-        # Initialize 0G gRPC services if available (for backwards compatibility)
-        self.compute_provider = None
-        self.compute_provider_name = compute_provider
-        
-        # Initialize 0G storage for all providers (for data layer)
-        # Uses gRPC sidecar (more reliable than CLI)
+        # Configure blockchain network for agents/payments
         try:
-            rprint("[cyan]   Initializing 0G Storage via gRPC sidecar...[/cyan]")
-            from chaoschain_sdk.providers.storage import ZeroGStorageGRPC
-            self.zg_storage = ZeroGStorageGRPC(grpc_url="localhost:50051")
-            if self.zg_storage.is_available:
-                rprint("[green]✅ 0G Storage gRPC sidecar connected[/green]")
-                rprint("[cyan]   Using 0G Storage sidecar on localhost:50051[/cyan]")
-            else:
-                rprint("[yellow]⚠️  0G Storage sidecar not available[/yellow]")
-                rprint("[yellow]📘 Starting 0G sidecar automatically...[/yellow]")
-                self.zg_storage = None
-        except Exception as e:
-            rprint(f"[yellow]⚠️  0G Storage sidecar not available: {e}[/yellow]")
-            rprint("[yellow]📘 Starting 0G sidecar automatically...[/yellow]")
-            self.zg_storage = None
-        
-        # Initialize compute provider
-        if compute_provider == "0g":
-            try:
-                from chaoschain_sdk.providers.compute import ZeroGComputeGRPC, VerificationMethod
-                
-                self.zg_compute = ZeroGComputeGRPC(grpc_url="localhost:50051")
-                
-                if self.zg_compute.is_available:
-                    rprint("[green]✅ 0G Compute gRPC service available[/green]")
-                    self.compute_provider = self.zg_compute
-                    self.compute_provider_name = "0G Compute"
-                else:
-                    rprint("[yellow]⚠️  0G Compute gRPC service not available[/yellow]")
-                
-            except Exception as e:
-                rprint(f"[yellow]⚠️  0G Compute not available: {e}[/yellow]")
-                rprint("[yellow]   Will use CrewAI fallback for compute[/yellow]")
-                self.zg_compute = None
-        
-        # Display active compute provider
-        rprint(f"[bold green]🔧 Active Compute Provider: {compute_provider.upper()}[/bold green]")
-        
-        # Use 0G network for data layer (storage) - consistent with Triple-Verified Stack
-        # Compute can be EigenCompute (Layer 2) while using 0G for data (Layer 3)
-        network = NetworkConfig.ZEROG_TESTNET
-        rprint(f"[cyan]🌐 Network: 0G Testnet (for data layer storage)[/cyan]")
+            network = NetworkConfig(self.network_name)
+        except ValueError:
+            rprint(f"[yellow]⚠️  Unsupported NETWORK '{self.network_name}', defaulting to ethereum-sepolia[/yellow]")
+            network = NetworkConfig.ETHEREUM_SEPOLIA
+        rprint(f"[cyan]🌐 Network: {self.network_profile['display_name']}[/cyan]")
         
         rprint("[cyan]   Creating Alice agent...[/cyan]")
         self.alice_agent = GenesisServerAgentSDK(
@@ -475,7 +801,7 @@ class GenesisStudioX402Orchestrator:
             network=network,
             enable_ap2=True,
             enable_process_integrity=True,
-            compute_provider=compute_provider,
+            compute_provider=alice_compute_provider,
             eigenai_api_key=os.getenv("EIGEN_API_KEY")
         )
         rprint("[green]   Alice agent created![/green]")
@@ -488,29 +814,34 @@ class GenesisStudioX402Orchestrator:
             network=network,
             enable_ap2=True,
             enable_process_integrity=True,
-            compute_provider=compute_provider,
+            compute_provider=bob_compute_provider,
             eigenai_api_key=os.getenv("EIGEN_API_KEY")
         )
         rprint("[green]   Bob agent created![/green]")
         
-        rprint("[cyan]   Creating Charlie agent...[/cyan]")
-        self.charlie_agent = GenesisClientAgent(
-            agent_name="Charlie",
-            agent_domain="charlie.chaoschain-studio.com",
-            agent_role=AgentRole.CLIENT,
-            network=network,
-            enable_ap2=True,  
-            enable_process_integrity=False  # Client doesn't need process integrity
-        )
-        rprint("[green]   Charlie agent created![/green]")
+        if self.charlie_enabled:
+            rprint("[cyan]   Creating Charlie agent...[/cyan]")
+            self.charlie_agent = GenesisClientAgent(
+                agent_name="Charlie",
+                agent_domain="charlie.chaoschain-studio.com",
+                agent_role=AgentRole.CLIENT,
+                network=network,
+                enable_ap2=True,  
+                enable_process_integrity=False  # Client doesn't need process integrity
+            )
+            rprint("[green]   Charlie agent created![/green]")
+            self.charlie_sdk = self.charlie_agent.sdk
+        else:
+            self.charlie_agent = None
+            self.charlie_sdk = None
+            rprint("[yellow]ℹ️  Charlie agent is deactivated for this run[/yellow]")
         
         # Keep SDK references for compatibility with existing code
         self.alice_sdk = self.alice_agent.sdk
         self.bob_sdk = self.bob_agent.sdk
-        self.charlie_sdk = self.charlie_agent.sdk
         
         # Display agent status
-        for name, agent in [("Alice", self.alice_agent), ("Bob", self.bob_agent), ("Charlie", self.charlie_agent)]:
+        for name, agent in [("Alice", self.alice_agent), ("Bob", self.bob_agent)]:
             rprint(f"✅ {name} CrewAI Agent initialized:")
             rprint(f"   Agent Name: {agent.agent_name}")
             rprint(f"   Agent Domain: {agent.agent_domain}")
@@ -520,47 +851,76 @@ class GenesisStudioX402Orchestrator:
             rprint(f"   AP2 Integration: ✅ Enabled")
             rprint(f"   Process Integrity: {'✅ Enabled' if hasattr(agent.sdk, 'process_integrity') and agent.sdk.process_integrity else '❌ Disabled'}")
             rprint(f"   x402 Payment Support: ✅")
+        if self.charlie_agent:
+            rprint("✅ Charlie agent initialized (standby mode)")
+            rprint(f"   Agent Name: {self.charlie_agent.agent_name}")
+            rprint(f"   Agent Domain: {self.charlie_agent.agent_domain}")
+            rprint(f"   Mode: Standby / Deactivated")
         
         # Store wallet addresses for later use
-        self.results["wallets"] = {
+        wallets = {
             "Alice": self.alice_sdk.wallet_address,
-            "Bob": self.bob_sdk.wallet_address,
-            "Charlie": self.charlie_sdk.wallet_address
+            "Bob": self.bob_sdk.wallet_address
+        }
+        if self.charlie_sdk:
+            wallets["Charlie"] = self.charlie_sdk.wallet_address
+        self.results["wallets"] = wallets
+        self.results["compute_providers"] = {
+            "alice": alice_compute_provider,
+            "bob": bob_compute_provider
+        }
+        
+        return {
+            "compute_provider": {
+                "alice": alice_compute_provider,
+                "bob": bob_compute_provider
+            },
+            "wallets": self.results["wallets"]
         }
     
     def _fund_agent_wallets(self):
-        """Fund all agent wallets from 0G Testnet faucet"""
+        """Fund all agent wallets on the active network"""
         
-        agents = [("Alice", self.alice_sdk), ("Bob", self.bob_sdk), ("Charlie", self.charlie_sdk)]
+        agents = [("Alice", self.alice_sdk), ("Bob", self.bob_sdk)]
+        if self.charlie_sdk:
+            agents.append(("Charlie", self.charlie_sdk))
         funded_agents = []
         
         print("💰 Checking wallet balances...")
+        min_balance = 0.02
         for agent_name, sdk in agents:
             balance = sdk.wallet_manager.get_wallet_balance(agent_name)
             address = sdk.wallet_manager.get_wallet_address(agent_name)
-            print(f"   {agent_name}: {balance:.4f} A0GI ({address})")
+            print(f"   {agent_name}: {balance:.4f} {self.native_token_symbol} ({address})")
             
-            if balance > 0.001:  # Has some A0GI for gas
+            if balance > min_balance:  # Has some native token for gas
                 funded_agents.append(agent_name)
             else:
-                print(f"   ⚠️  {agent_name} needs funding. Please send A0GI to {address}")
+                print(f"   ⚠️  {agent_name} needs funding. Please send {self.native_token_symbol} to {address}")
         
         if len(funded_agents) == 0:
-            print("🔗 Fund your wallets at: https://faucet.0g.ai/")
-            print("   Each wallet needs ~0.1 A0GI for gas fees")
+            if self.network_profile.get("faucet_url"):
+                print(f"🔗 Fund your wallets at: {self.network_profile['faucet_url']}")
+            print(f"   {self.network_profile.get('gas_recommendation', 'Ensure adequate gas balance')}")
         
         self.results["funding"] = {
             "success": len(funded_agents) > 0,
             "funded_agents": funded_agents
         }
+        
+        return self.results["funding"]
     
     def _register_agents_onchain(self):
         """Register all CrewAI agents on the ERC-8004 IdentityRegistry"""
         
         registration_results = {}
         
-        # Register each CrewAI agent
-        for agent_name, agent in [("Alice", self.alice_agent), ("Bob", self.bob_agent), ("Charlie", self.charlie_agent)]:
+        # Register each CrewAI agent (only active)
+        agents_to_register = [("Alice", self.alice_agent), ("Bob", self.bob_agent)]
+        if self.charlie_agent:
+            agents_to_register.append(("Charlie", self.charlie_agent))
+
+        for agent_name, agent in agents_to_register:
             try:
                 rprint(f"[blue]🔧 Registering agent: {agent.agent_domain}[/blue]")
                 agent_id = agent.register_identity()
@@ -582,49 +942,76 @@ class GenesisStudioX402Orchestrator:
             "success": all("agent_id" in result for result in registration_results.values()),
             "agents": registration_results
         }
+        
+        return self.results["registration"]
     
     def _create_ap2_intent_mandate(self) -> Dict[str, Any]:
         """Create AP2 intent mandate for micro-loan evaluation service"""
         
-        # Create intent mandate using Alice's AP2 manager - Micro-Loan Scenario
-        intent_mandate = self.alice_sdk.create_intent_mandate(
-            user_description="I need a 0.5 USDC micro-loan for operational expenses. I have 0.78 ERC-8004 reputation score, 8 successful payment history, and can stake 0.25 USDC (50% collateral). No previous defaults. Requesting autonomous loan evaluation and approval.",
-            merchants=None,  # Allow any lender
-            skus=None,  # Allow any loan product
-            requires_refundability=False,  # Loans are not refundable
-            expiry_minutes=60
-        )
+        try:
+            # Create intent mandate using Alice's AP2 manager - Micro-Loan Scenario
+            intent_mandate = self.alice_sdk.create_intent_mandate(
+                user_description="I need a 0.5 USDC micro-loan for operational expenses. I have 0.78 ERC-8004 reputation score, 8 successful payment history, and can stake 0.25 USDC (50% collateral). No previous defaults. Requesting autonomous loan evaluation and approval.",
+                merchants=None,  # Allow any lender
+                skus=None,  # Allow any loan product
+                requires_refundability=False,  # Loans are not refundable
+                expiry_minutes=60
+            )
+            
+            # Create cart mandate
+            cart_mandate = self.alice_sdk.create_cart_mandate(
+                cart_id="cart_loan_request_001",
+                items=[{"service": "loan_evaluation_agent", "description": "Autonomous micro-loan creditworthiness evaluation with TEE verification", "price": self.network_profile["analysis_payment_amount"]}],
+                total_amount=self.network_profile["analysis_payment_amount"],
+                currency=self.payment_token_symbol,
+                merchant_name="Alice Loan Officer Agent",
+                expiry_minutes=15
+            )
+            
+            # Verify JWT token instead of mandate chain for Google AP2
+            mandate_verified = True  # Google AP2 uses JWT verification
+            if hasattr(cart_mandate, 'merchant_authorization') and cart_mandate.merchant_authorization:
+                if hasattr(self.alice_sdk, "google_ap2") and self.alice_sdk.google_ap2:
+                    jwt_payload = self.alice_sdk.verify_jwt_token(cart_mandate.merchant_authorization)
+                    mandate_verified = bool(jwt_payload)
+                else:
+                    mandate_verified = True
         
-        # Create cart mandate
-        cart_mandate = self.alice_sdk.create_cart_mandate(
-            cart_id="cart_loan_request_001",
-            items=[{"service": "loan_evaluation_agent", "description": "Autonomous micro-loan creditworthiness evaluation with TEE verification", "price": 0.001}],
-            total_amount=0.001,
-            currency="A0GI",
-            merchant_name="Alice Loan Officer Agent",
-            expiry_minutes=15
-        )
-        
-        # Verify JWT token instead of mandate chain for Google AP2
-        mandate_verified = True  # Google AP2 uses JWT verification
-        if hasattr(cart_mandate, 'merchant_authorization') and cart_mandate.merchant_authorization:
-            jwt_payload = self.alice_sdk.google_ap2_integration.verify_jwt_token(cart_mandate.merchant_authorization)
-            mandate_verified = bool(jwt_payload)
+        except PaymentError as ap2_error:
+            rprint(f"[yellow]⚠️  Google AP2 unavailable ({ap2_error}); using simulated mandate.[/yellow]")
+            now = datetime.now()
+            intent_mandate = SimpleNamespace(
+                user_description="SIMULATED: Micro-loan request (AP2 service not enabled)",
+                intent_id="intent_simulated_001",
+                expiry_time=(now + timedelta(minutes=60)).isoformat()
+            )
+            cart_mandate = SimpleNamespace(
+                cart_id="cart_loan_request_001",
+                items=[{"service": "loan_evaluation_agent", "description": "Autonomous micro-loan evaluation (simulated)", "price": self.network_profile["analysis_payment_amount"]}],
+                total_amount=self.network_profile["analysis_payment_amount"],
+                currency=self.payment_token_symbol,
+                merchant_name="Alice Loan Officer Agent",
+                merchant_authorization=None,
+                expiry_time=(now + timedelta(minutes=15)).isoformat()
+            )
+            mandate_verified = True
         
         # Display created mandates
         rprint(f"[cyan]📝 Created Google AP2 IntentMandate[/cyan]")
         if hasattr(intent_mandate, 'user_description'):
-            rprint(f"   Description: {intent_mandate.user_description[:100]}...")
+            rprint(f"   Description: {intent_mandate.user_description}")
         if hasattr(intent_mandate, 'intent_id'):
             rprint(f"   Intent ID: {intent_mandate.intent_id}")
             rprint(f"   Expires: {intent_mandate.expiry_time}")
         rprint(f"[cyan]🛒 Created Google AP2 CartMandate with JWT[/cyan]")
-        rprint(f"   Cart ID: cart_winter_jacket_001")
-        rprint(f"   Items: {len(cart_mandate.items) if hasattr(cart_mandate, 'items') else 1} items, Total: 2.0 USDC")
-        if hasattr(cart_mandate, 'merchant_authorization'):
-            # ✅ (D) Redact JWT for security (show only first 20 chars)
-            jwt_redacted = cart_mandate.merchant_authorization[:20] + "...[REDACTED]" if len(cart_mandate.merchant_authorization) > 20 else "[REDACTED]"
-            rprint(f"   JWT: {jwt_redacted}")
+        cart_id = getattr(cart_mandate, 'cart_id', 'cart_loan_request_001')
+        total_amount = getattr(cart_mandate, 'total_amount', 0.0)
+        currency = getattr(cart_mandate, 'currency', self.payment_token_symbol)
+        items_count = len(getattr(cart_mandate, 'items', [])) if hasattr(cart_mandate, 'items') else 1
+        rprint(f"   Cart ID: {cart_id}")
+        rprint(f"   Items: {items_count} items, Total: {total_amount} {currency}")
+        if hasattr(cart_mandate, 'merchant_authorization') and cart_mandate.merchant_authorization:
+            rprint("   JWT: [PROTECTED]")
         
         self.results["ap2_intent"] = {
             "intent_mandate": intent_mandate,
@@ -643,7 +1030,7 @@ class GenesisStudioX402Orchestrator:
         }
 
     def _execute_smart_shopping_with_integrity(self, intent_id: Optional[str] = None) -> tuple[Dict[str, Any], Any, Optional[str], Optional[str]]:
-        """Execute smart shopping with Process Integrity verification (EigenAI/0G/CrewAI)
+        """Execute smart shopping with Process Integrity verification (EigenAI/EigenCompute/CrewAI)
         
         Returns:
             tuple: (analysis_data, process_integrity_proof, proof_cid, exec_hash)
@@ -651,10 +1038,13 @@ class GenesisStudioX402Orchestrator:
         
         if intent_id:
             rprint(f"[cyan]🔗 Linking to AP2 Intent ID: {intent_id}[/cyan]")
-        rprint(f"[yellow]🏦 Alice evaluating loan request using {os.getenv('COMPUTE_PROVIDER', 'CrewAI').upper()} (TEE-verified)...[/yellow]")
+        rprint(f"[yellow]🏦 Alice evaluating loan request using {self.compute_provider_name.upper()} (TEE-verified)...[/yellow]")
         
-        # Charlie's loan request (using Charlie's wallet address)
-        charlie_address = self.charlie_agent.wallet.address if hasattr(self.charlie_agent, 'wallet') else "0xCharlie"
+        # Borrower (Charlie deactivated by default)
+        if self.charlie_agent and hasattr(self.charlie_agent, 'wallet'):
+            charlie_address = self.charlie_agent.wallet.address
+        else:
+            charlie_address = "0xBorrowerDeactivated"
         
         rprint(f"[cyan]📋 Loan Request:[/cyan]")
         rprint(f"   Borrower: {charlie_address}")
@@ -662,7 +1052,7 @@ class GenesisStudioX402Orchestrator:
         rprint(f"   Purpose: operational_expenses")
         rprint()
         
-        # Use agent SDK which handles provider routing (EigenAI, 0G, or CrewAI)
+        # Use agent SDK which handles provider routing (EigenAI, EigenCompute, or CrewAI)
         analysis_result = self.alice_agent.generate_loan_evaluation(
             borrower_address=charlie_address,
             loan_amount=0.5,
@@ -677,288 +1067,156 @@ class GenesisStudioX402Orchestrator:
         proof_cid = analysis_result.get("proof_cid")
         exec_hash = analysis_result.get("exec_hash")
         
+        tee_exec_meta = analysis_result.get("analysis", {}).get("tee_execution", {}) if isinstance(analysis_result.get("analysis"), dict) else {}
+        process_proof = analysis_result.get("process_integrity_proof")
+        summary_proof = self._normalize_process_proof(
+            process_proof,
+            exec_hash=exec_hash,
+            tee_exec_meta=tee_exec_meta,
+            fallback_reason="Process integrity proof unavailable (fallback path in use)."
+        )
+        if summary_proof:
+            self.results["process_integrity_proof"] = summary_proof
+        self.results["smart_shopping_analysis"] = analysis_result["analysis"]
         return (
             analysis_result["analysis"], 
-            analysis_result["process_integrity_proof"],
+            process_proof,
             proof_cid,
             exec_hash
         )
         
-        # Create shopping analysis task for 0G Compute
-        shopping_task = {
-            "agent_id": "Alice",
-            "role": "server",
-            "task_type": "smart_shopping_analysis",
-            "model": "gpt-oss-120b",
-            "prompt": """Analyze this shopping request and provide recommendations:
-
-User Request: "Find me the best winter jacket in green, budget $150"
-
-Provide:
-1. Best product recommendation with price
-2. Alternative options if green not available
-3. Quality assessment (1-100)
-4. Value score (1-100)
-5. Confidence in recommendation (percentage)
-
-Respond in JSON format with fields: product_name, price, color, quality_score, value_score, confidence, alternatives.""",
-            "max_tokens": 600,
-            "temperature": 0.4
-        }
-        
-        try:
-            from chaoschain_sdk.providers.compute import VerificationMethod
-        except ImportError:
-            # Fallback if not available in PyPI version
-            VerificationMethod = None
-        
-        rprint("[cyan]📤 Submitting shopping analysis to 0G Compute...[/cyan]")
-        job_id = self.zg_compute.submit(
-            task=shopping_task,
-            verification=VerificationMethod.TEE_ML,
-            idempotency_key=f"alice_shopping_{int(time.time())}"
-        )
-        
-        rprint(f"[green]✅ Job submitted: {job_id}[/green]")
-        
-        # Wait for completion
-        rprint("[yellow]⏳ Waiting for TEE-verified AI inference...[/yellow]")
-        for i in range(30):
-            status = self.zg_compute.status(job_id)
-            state = status.get("state", "unknown")
-            
-            if state == "completed":
-                rprint("[green]✅ Analysis completed in TEE![/green]")
-                break
-            elif state == "failed":
-                rprint(f"[red]❌ Job failed, using fallback[/red]")
-                return self._execute_smart_shopping_fallback()
-            
-            time.sleep(3)
-        
-        # Get result with attestation
-        result = self.zg_compute.result(job_id)
-        
-        if result.success:
-            rprint(f"[green]✅ Result retrieved with TEE proof[/green]")
-            rprint(f"[cyan]   Execution Hash: {result.execution_hash}[/cyan]")
-            
-            # Display Alice's analysis
-            rprint("[bold]🛒 Alice's Shopping Analysis:[/bold]")
-            import json
-            try:
-                output_str = result.output.get("output", "{}") if isinstance(result.output, dict) else str(result.output)
-                if "```json" in output_str:
-                    json_start = output_str.find("```json") + 7
-                    json_end = output_str.find("```", json_start)
-                    output_str = output_str[json_start:json_end].strip()
-                
-                analysis = json.loads(output_str)
-                rprint(f"   Product: {analysis.get('product_name', 'N/A')}")
-                rprint(f"   Price: ${analysis.get('price', 0)}")
-                rprint(f"   Color: {analysis.get('color', 'N/A')}")
-                rprint(f"   Quality Score: {analysis.get('quality_score', 0)}/100")
-                rprint(f"   Confidence: {analysis.get('confidence', 0)}%")
-                
-                analysis_data = analysis
-            except Exception as e:
-                rprint(f"[yellow]   Raw output: {str(result.output)[:200]}...[/yellow]")
-                analysis_data = {"raw_output": str(result.output), "confidence": 85}
-            
-            # Create process integrity proof
-            process_integrity_proof = {
-                "job_id": job_id,
-                "execution_hash": result.execution_hash,
-                "verification_method": str(result.verification_method),
-                "verified": True
-            }
-            
-            self.results["analysis"] = analysis_data
-            self.results["process_integrity_proof"] = process_integrity_proof
-            
-            return analysis_data, process_integrity_proof
-        
-        return self._execute_smart_shopping_fallback()
-    
     def _execute_smart_shopping_fallback(self) -> tuple[Dict[str, Any], Any]:
-        """Fallback to CrewAI when 0G Compute unavailable"""
+        """Fallback to CrewAI when Eigen stack unavailable"""
         analysis_result = self.alice_agent.generate_smart_shopping_analysis(
             item_type="winter_jacket",
             color="green", 
             budget=150.0,
             premium_tolerance=0.20
         )
-        return analysis_result["analysis"], analysis_result["process_integrity_proof"]
+        process_proof = analysis_result.get("process_integrity_proof")
+        tee_exec_meta = analysis_result.get("analysis", {}).get("tee_execution", {}) if isinstance(analysis_result.get("analysis"), dict) else {}
+        summary_proof = self._normalize_process_proof(
+            process_proof,
+            exec_hash=None,
+            tee_exec_meta=tee_exec_meta,
+            fallback_reason="Process integrity proof unavailable (CrewAI fallback)."
+        )
+        if summary_proof:
+            self.results["process_integrity_proof"] = summary_proof
+        self.results["smart_shopping_analysis"] = analysis_result["analysis"]
+        return analysis_result["analysis"], process_proof
     
-    def _store_analysis_on_0g_storage(self, analysis_data: Dict[str, Any], process_integrity_proof: Any) -> str:
-        """Store analysis data on 0G Storage via gRPC"""
-        
-        if not self.zg_storage or not self.zg_storage.is_available:
-            rprint(f"[yellow]⚠️  0G Storage not available - continuing without storage[/yellow]")
-            rprint(f"[yellow]   Analysis data preserved in memory for demo[/yellow]")
-            
-            self.results["storage_analysis"] = {
-                "success": False,
-                "root_hash": None,
-                "uri": "No storage available",
-                "note": "Demo continued without 0G Storage"
-            }
+    def _store_analysis_evidence(self, analysis_data: Dict[str, Any], process_integrity_proof: Any) -> Optional[str]:
+        """Store analysis data using the ChaosChain SDK evidence pipeline."""
+        if not self.alice_sdk:
             return None
-        
-        # Create evidence package for 0G Storage
-        evidence = {
+        evidence_payload = {
             "type": "genesis_studio_evidence",
             "agent": "Alice",
             "role": "server",
             "service": "smart_shopping_analysis",
             "timestamp": datetime.now().isoformat(),
             "analysis": analysis_data,
-            "process_integrity_proof": str(process_integrity_proof) if process_integrity_proof else None,
-            "network": "0G Testnet"
+            "process_integrity_proof": process_integrity_proof,
+            "network": self.network_profile["display_name"]
         }
-        
         try:
-            # Store on 0G Storage using gRPC
-            result = self.zg_storage.put(
-                blob=str(evidence).encode(),
-                mime="application/json",
-                idempotency_key=f"alice_analysis_{int(time.time())}"
-            )
-            
-            if result.success:
-                root_hash = result.metadata.get("root_hash", result.hash)
-                tx_hash = result.metadata.get("tx_hash", "")
-                
-                rprint(f"[green]📦 Analysis uploaded to 0G Storage[/green]")
-                rprint(f"   Root Hash: {root_hash}")
-                rprint(f"   TX Hash: {tx_hash}")
-                rprint(f"   URI: {result.uri}")
-                
-                self.results["storage_analysis"] = {
-                    "success": True,
-                    "root_hash": root_hash,
-                    "tx_hash": tx_hash,
-                    "uri": result.uri
-                }
-                return root_hash
-            else:
-                rprint(f"[yellow]⚠️  0G Storage failed: {result.error}[/yellow]")
-                self.results["storage_analysis"] = {
-                    "success": False,
-                    "error": result.error
-                }
-                return None
-                
-        except Exception as e:
-            rprint(f"[yellow]⚠️  0G Storage error: {e}[/yellow]")
-            rprint(f"[yellow]   Analysis data preserved in memory for demo[/yellow]")
-            
+            cid = self.alice_sdk.store_evidence(evidence_payload, "loan-analysis")
+            rprint("[green]📦 Analysis evidence stored via ChaosChain SDK[/green]")
+            rprint(f"   Evidence CID: {cid}")
+            self.results["storage_analysis"] = {
+                "success": True,
+                "cid": cid,
+                "tx_hash": None
+            }
+            return cid
+        except Exception as exc:
+            rprint(f"[yellow]⚠️  Evidence storage skipped: {exc}[/yellow]")
             self.results["storage_analysis"] = {
                 "success": False,
-                "error": str(e),
-                "note": "Demo continued without storage"
+                "error": str(exc)
             }
             return None
-    
-    def _execute_0g_token_payment(self, analysis_cid: str, analysis_data: Dict[str, Any], cart_mandate: Any, 
-                                   proof_cid: Optional[str] = None, exec_hash: Optional[str] = None) -> Dict[str, Any]:
-        """Execute x402 payment with A0GI tokens - Charlie pays Alice (with AP2 intent authorization)
-        
-        Args:
-            analysis_cid: CID of analysis data on 0G storage
-            analysis_data: Analysis data dictionary
-            cart_mandate: AP2 cart mandate
-            proof_cid: CID of ProcessProof on 0G storage (for accountability)
-            exec_hash: Execution hash for deterministic verification
-        """
-        
-        # Calculate payment based on analysis quality (using meaningful amounts for demo)
-        base_payment = 0.001  # ✅ 0.001 A0GI (non-dust amount for explorer visibility)
-        confidence_score = analysis_data.get("analysis", {}).get("confidence", 0.85)
-        quality_multiplier = confidence_score  # Direct confidence scaling
-        final_amount = base_payment * quality_multiplier
-        
-        # Display AP2 Intent Authorization (Layer 1 of Triple-Verified Stack)
-        rprint(f"[cyan]🔐 AP2 Intent Authorization (Layer 1):[/cyan]")
-        total_amount = final_amount
-        if hasattr(cart_mandate, 'contents') and hasattr(cart_mandate.contents, 'payment_request'):
-            total_amount = cart_mandate.contents.payment_request.details.total.amount.value
-            rprint(f"   Intent Verified: ✅")
-            rprint(f"   Authorized Amount: ${total_amount}")
-            rprint(f"   Cart ID: {cart_mandate.cart_id if hasattr(cart_mandate, 'cart_id') else 'N/A'}")
-        else:
-            rprint(f"   Intent Verified: ✅")
-            rprint(f"   User Intent: Smart shopping with green preference")
-        rprint(f"   Authorization Method: Google AP2")
-        rprint()
-        
-        # x402 Crypto Settlement with A0GI (Layer 3 of Triple-Verified Stack)
-        rprint(f"[cyan]💰 x402 Crypto Settlement (A0GI tokens):[/cyan]")
-        print(f"💰 Creating x402 payment request: Charlie → Alice ({final_amount:.4f} A0GI)")
-        
-        # Execute direct A0GI payment on 0G network
-        rprint(f"[yellow]📤 Executing direct A0GI transfer...[/yellow]")
-        
-        x402_payment_result = self.charlie_sdk.execute_payment(
-            to_agent="Alice",
-            amount=final_amount,
-            service_type="smart_shopping"
-        )
-        
-        # Display payment results
-        rprint(f"[green]💳 Payment Successful (Direct A0GI Transfer)[/green]")
-        rprint(f"   From: Charlie")
-        rprint(f"   To: Alice")
-        if isinstance(x402_payment_result, dict):
-            amount = x402_payment_result.get("amount", 0)
-            tx_hash = x402_payment_result.get("transaction_hash", x402_payment_result.get("tx_hash", "N/A"))
-        else:
-            amount = getattr(x402_payment_result, "amount", 0)
-            tx_hash = getattr(x402_payment_result, "transaction_hash", "N/A")
-        
-        rprint(f"   Amount: {amount:.4f} A0GI" if isinstance(amount, (int, float)) else f"   Amount: {amount}")
-        rprint(f"   Transaction: {tx_hash}")
-        if tx_hash and tx_hash != "N/A":
-            if not tx_hash.startswith('0x'):
-                tx_hash = f"0x{tx_hash}"
-        rprint(f"   Explorer: https://chainscan-galileo.0g.ai/tx/{tx_hash}")
-        rprint(f"   Service: Smart Shopping Service")
-        rprint(f"   Network: 0G Galileo Testnet")
-        
-        # ✅ (C) Display proof CID linking - accountability layer
-        if proof_cid:
-            rprint(f"[bold cyan]🔗 Payment ↔ Proof Linkage (Accountability):[/bold cyan]")
-            rprint(f"   ProcessProof CID: {proof_cid}")
-            if exec_hash:
-                rprint(f"   Execution Hash: 0x{exec_hash[:16]}...")
-            rprint(f"   🎯 Payment verified against TEE execution proof")
-            rprint(f"   📦 Third parties can verify: 0G Storage → Proof CID → Exec Hash")
-        
-        # Triple-Verified Stack Summary
-        rprint()
-        rprint(f"[bold green]🔗 Triple-Verified Stack Complete:[/bold green]")
-        rprint(f"   ✅ Layer 1: AP2 Intent Verification (Google)")
-        rprint(f"   ✅ Layer 2: ChaosChain Process Integrity (ChaosChain + 0G Compute)")
-        rprint(f"   ✅ Layer 3: Adjudication/Accountability (ChaosChain)")
-        
-        payment_results = {
-            "x402_payment_result": x402_payment_result,
-            "amount": x402_payment_result.amount,
-            "ap2_authorized": True,
-            "currency": "A0GI",
-            "from": "Charlie",
-            "to": "Alice",
-            "service": "smart_shopping",
-            "x402_success": bool(x402_payment_result.transaction_hash),
-            "network": "0G Testnet",
-            "triple_verified": True,
-            "proof_cid": proof_cid,  # ✅ ProcessProof CID for accountability
-            "exec_hash": exec_hash,  # ✅ Deterministic execution hash
-            "accountability_verified": bool(proof_cid and exec_hash)
+
+    def _execute_alice_bob_payment_series(self, service_description: str) -> Dict[str, Any]:
+        """Execute three consecutive x402 settlements between Alice and Bob."""
+        payment_manager = getattr(self.alice_sdk, "payment_manager", None)
+        if not payment_manager:
+            rprint("[red]❌ Alice SDK missing payment manager; cannot execute x402 settlements[/red]")
+            self.results["alice_bob_payments"] = {"runs": [], "successes": 0, "transactions": []}
+            return self.results["alice_bob_payments"]
+
+        total_runs = 3
+        payment_amount = float(os.getenv("GENESIS_PAYMENT_AMOUNT_USDC", str(self.network_profile["analysis_payment_amount"])))
+        runs: List[Dict[str, Any]] = []
+        tx_records: List[Dict[str, Any]] = []
+
+        for run_index in range(1, total_runs + 1):
+            payment_proof = None
+            error: Optional[str] = None
+            latency: Optional[float] = None
+            try:
+                manager_request = payment_manager.create_x402_payment_request(
+                    from_agent=self.alice_agent.agent_name,
+                    to_agent=self.bob_agent.agent_name,
+                    amount=payment_amount,
+                    currency=self.payment_token_symbol,
+                    service_description=f"{service_description} #{run_index}"
+                )
+                wait_title = f"Alice → Bob x402 payment #{run_index} ({payment_amount:.4f} {self.payment_token_symbol})"
+                with WaitBar(self.console, wait_title) as wait:
+                    payment_proof = payment_manager.execute_x402_payment(manager_request)
+                    latency = wait.elapsed
+            except PaymentError as e:
+                error = str(e)
+            except Exception as generic_error:
+                error = str(generic_error)
+
+            if not payment_proof:
+                rprint(f"[red]❌ x402 settlement #{run_index} failed: {error}[/red]")
+                runs.append({
+                    "run": run_index,
+                    "status": "failed",
+                    "error": error
+                })
+                continue
+
+            rprint(f"[green]✅ x402 settlement #{run_index} succeeded[/green]")
+            rprint(f"   Payment ID: {payment_proof.payment_id}")
+            rprint(f"   Amount: {payment_proof.amount} {payment_proof.currency}")
+            rprint(f"   Transaction Hash: {payment_proof.transaction_hash}")
+            runs.append({
+                "run": run_index,
+                "status": "success",
+                "tx_hash": payment_proof.transaction_hash,
+                "payment_id": payment_proof.payment_id,
+                "amount": payment_proof.amount,
+                "currency": payment_proof.currency,
+                "receipt": payment_proof.receipt_data or {},
+                "proof": payment_proof,
+                "latency": latency
+            })
+            tx_records.append({
+                "label": f"Alice→Bob settlement #{run_index}",
+                "tx_hash": payment_proof.transaction_hash
+            })
+
+        successes = sum(1 for entry in runs if entry["status"] == "success")
+        self.results["alice_bob_payments"] = {
+            "runs": runs,
+            "successes": successes,
+            "amount": payment_amount,
+            "transactions": tx_records
         }
-        
-        self.results["0g_payment"] = payment_results
-        return payment_results
+        return self.results["alice_bob_payments"]
+
+    def _get_latest_bob_payment_receipt(self) -> Optional[Dict[str, Any]]:
+        runs = self.results.get("alice_bob_payments", {}).get("runs", [])
+        for entry in reversed(runs):
+            if entry.get("status") == "success":
+                return entry
+        return None
+
     
     def _validate_analysis_with_crewai(self, analysis_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -1002,8 +1260,11 @@ Respond in JSON format with fields: product_name, price, color, quality_score, v
                 bob_agent_id = 2  # Assume Bob is agent ID 2
                 alice_agent_id = 1  # Assume Alice is agent ID 1
             
-            # Alice requests validation from Bob via ERC-8004
-            tx_hash = self.alice_sdk.request_validation(bob_agent_id, data_hash)
+            validator_identifier = self.bob_agent.agent_domain if self.bob_agent else str(bob_agent_id)
+            if analysis_cid:
+                tx_hash = self.alice_agent.request_validation(analysis_cid, validator_identifier)
+            else:
+                tx_hash = self.alice_sdk.request_validation(data_hash, bob_agent_id)
             
             rprint(f"[green]📋 Validation Request Sent[/green]")
             rprint(f"   Validator: Bob")
@@ -1033,8 +1294,13 @@ Respond in JSON format with fields: product_name, price, color, quality_score, v
         
         return tx_hash
     
-    def _perform_validation_with_eigencompute(self, analysis_data: Dict[str, Any], alice_exec_hash: Optional[str] = None, 
-                                           original_inputs: Optional[Dict[str, Any]] = None) -> tuple[int, Dict[str, Any]]:
+    def _perform_validation_with_eigencompute(
+        self,
+        analysis_data: Dict[str, Any],
+        alice_exec_hash: Optional[str] = None,
+        original_inputs: Optional[Dict[str, Any]] = None,
+        analysis_cid: Optional[str] = None
+    ) -> tuple[int, Dict[str, Any]]:
         """Bob performs validation by RE-EXECUTING Alice's exact loan evaluation for deterministic verification
         
         Args:
@@ -1042,16 +1308,15 @@ Respond in JSON format with fields: product_name, price, color, quality_score, v
             alice_exec_hash: Alice's execution hash for deterministic comparison
             original_inputs: Original inputs Alice used (borrower_address, loan_amount, erc8004_score, etc.)
         """
-        import os
-        import json
-        import hashlib
+        rprint("[yellow]⚙️  EigenCompute validation path disabled – using fallback validation instead.[/yellow]")
+        return self._perform_validation_with_payment_fallback(analysis_data, analysis_cid=analysis_cid)
         
-        rprint(f"[yellow]🔍 Bob performing validation using {os.getenv('COMPUTE_PROVIDER', 'CrewAI').upper()}...[/yellow]")
+        rprint(f"[yellow]🔍 Bob performing validation using {self.compute_provider_name.upper()}...[/yellow]")
         
         # ✅ DETERMINISTIC RE-RUN: Bob executes the SAME analysis with SAME inputs
         if original_inputs and self.compute_provider_name == "eigencompute" and hasattr(self.bob_agent, 'eigencompute'):
             rprint(f"[cyan]🔄 Bob re-executing Alice's loan evaluation with identical inputs for deterministic verification...[/cyan]")
-            rprint(f"[cyan]   Borrower: {original_inputs.get('borrower_address', 'N/A')[:10]}...[/cyan]")
+            rprint(f"[cyan]   Borrower: {original_inputs.get('borrower_address', 'N/A')}[/cyan]")
             rprint(f"[cyan]   Loan Amount: ${original_inputs.get('loan_amount', 0.5)} USDC[/cyan]")
             rprint(f"[cyan]   ERC-8004 Score: {original_inputs.get('erc8004_score', 0.78)}[/cyan]")
             
@@ -1062,7 +1327,7 @@ Respond in JSON format with fields: product_name, price, color, quality_score, v
                 app_id=app_id,
                 function="evaluate_loan",  # Same function Alice used
                 inputs={
-                    "borrower_address": original_inputs.get('borrower_address', '0xCharlie'),
+                    "borrower_address": original_inputs.get('borrower_address', '0xBorrowerDeactivated'),
                     "loan_amount": original_inputs.get('loan_amount', 0.5),
                     "erc8004_score": original_inputs.get('erc8004_score', 0.78),
                     "payment_history_count": original_inputs.get('payment_history_count', 8),
@@ -1109,26 +1374,26 @@ Respond in JSON format with fields: product_name, price, color, quality_score, v
             
             if alice_exec_hash == bob_exec_hash:
                 rprint(f"[bold green]✅ DETERMINISTIC MATCH: Exec hashes IDENTICAL![/bold green]")
-                rprint(f"[green]   Alice Hash: 0x{alice_exec_hash[:32]}...[/green]")
-                rprint(f"[green]   Bob Hash:   0x{bob_exec_hash[:32]}...[/green]")
+                rprint(f"[green]   Alice Hash: 0x{alice_exec_hash}[/green]")
+                rprint(f"[green]   Bob Hash:   0x{bob_exec_hash}[/green]")
                 rprint(f"[bold green]   🎯 Payment AUTO-RELEASED (verified execution)[/bold green]")
                 rprint(f"[green]   📦 Both agents produced identical output in TEE[/green]")
                 rprint(f"[green]   🔐 Accountability: Provable determinism achieved[/green]")
             else:
                 rprint(f"[bold red]❌ DETERMINISTIC MISMATCH: Different exec hashes![/bold red]")
-                rprint(f"[red]   Alice Hash: 0x{alice_exec_hash[:32]}...[/red]")
-                rprint(f"[red]   Bob Hash:   0x{bob_exec_hash[:32]}...[/red]")
+                rprint(f"[red]   Alice Hash: 0x{alice_exec_hash}[/red]")
+                rprint(f"[red]   Bob Hash:   0x{bob_exec_hash}[/red]")
                 if is_rerun:
                     rprint(f"[bold red]   ⚠️  CRITICAL: Same inputs → Different outputs![/bold red]")
                     rprint(f"[red]   🚨 Payment HELD pending investigation[/red]")
-                    rprint(f"[red]   📋 Evidence: Both proofs stored on 0G for dispute resolution[/red]")
+                    rprint(f"[red]   📋 Evidence: Both proofs stored in Eigen audit vault for dispute resolution[/red]")
                 else:
                     rprint(f"[yellow]   ℹ️  Expected: Bob ran different function (validation vs analysis)[/yellow]")
         
         if validation_result_raw.get("process_integrity_proof"):
             proof = validation_result_raw["process_integrity_proof"]
             if hasattr(proof, 'tee_signature'):
-                rprint(f"[cyan]   TEE Signature: {proof.tee_signature[:32]}...[/cyan]")
+                rprint(f"[cyan]   TEE Signature: {proof.tee_signature}[/cyan]")
             
             # Display Bob's validation (loan evaluation re-run)
             rprint("[bold]🔍 Bob's Loan Evaluation Re-Run:[/bold]")
@@ -1149,24 +1414,15 @@ Respond in JSON format with fields: product_name, price, color, quality_score, v
                 rprint(f"[yellow]   Using default score: 75[/yellow]")
                 score = 75  # Default score
             
-            # Direct A0GI Payment for validation
-            rprint(f"\n[cyan]💰 Direct A0GI Payment for validation:[/cyan]")
-            rprint(f"[yellow]📤 Executing direct A0GI transfer...[/yellow]")
-            
-            validation_payment_result = self.charlie_sdk.execute_payment(
-                to_agent="Bob",
-                amount=0.00005,  # 0.00005 A0GI for validation (small amount for demo)
-                service_type="validation"
-            )
-            
-            rprint(f"[green]💳 Payment Successful[/green]")
-            rprint(f"   From: Charlie → Bob")
-            rprint(f"   Amount: {validation_payment_result.amount:.4f} A0GI")
-            rprint(f"   Transaction: {validation_payment_result.transaction_hash}")
-            val_tx_hash = validation_payment_result.transaction_hash if validation_payment_result.transaction_hash.startswith('0x') else f"0x{validation_payment_result.transaction_hash}"
-            rprint(f"   Explorer: https://chainscan-galileo.0g.ai/tx/{val_tx_hash}")
-            
-            rprint(f"[green]✅ Validation payment recorded[/green]")
+            payment_receipt = self._get_latest_bob_payment_receipt()
+            validation_payment_result = payment_receipt.get("proof") if payment_receipt else None
+            if payment_receipt:
+                rprint(f"\n[cyan]💰 Referencing Alice → Bob settlement for validation payout[/cyan]")
+                rprint(f"[green]💳 Settlement Transaction: {payment_receipt['tx_hash']}[/green]")
+                rprint(f"   Amount: {payment_receipt['amount']} {payment_receipt['currency']}")
+            else:
+                rprint(f"\n[yellow]⚠️  No settlement receipt available for Bob yet[/yellow]")
+                validation_payment_result = None
             
             validation_result = {
                 "overall_score": score,
@@ -1182,13 +1438,13 @@ Respond in JSON format with fields: product_name, price, color, quality_score, v
         
         return 75, {"overall_score": 75, "verified": False}
     
-    def _perform_validation_with_payment_fallback(self, analysis_data: Dict[str, Any]) -> tuple[int, Dict[str, Any]]:
-        """Fallback validation when 0G Compute not available - uses CrewAI fallback"""
+    def _perform_validation_with_payment_fallback(self, analysis_data: Dict[str, Any], analysis_cid: Optional[str] = None) -> tuple[int, Dict[str, Any]]:
+        """Fallback validation when Eigen stack is unavailable - uses CrewAI fallback"""
         
         # Use existing CrewAI validation logic
-        if not analysis_data:
+        if not analysis_data and analysis_cid:
             analysis_data = self.bob_sdk.retrieve_evidence(analysis_cid)
-        else:
+        if not analysis_data:
             # No storage available - use in-memory analysis data
             analysis_data = self.results.get("smart_shopping_analysis", {})
             rprint(f"[yellow]⚠️  No IPFS storage - using in-memory analysis data for validation[/yellow]")
@@ -1225,33 +1481,31 @@ Respond in JSON format with fields: product_name, price, color, quality_score, v
             validation_result = self._validate_analysis_with_crewai(analysis_data)
         score = validation_result.get("overall_score", 0)
         
-        # Execute direct A0GI payment for validation
-        rprint(f"\n[cyan]💰 Direct A0GI Payment for validation:[/cyan]")
-        rprint(f"[yellow]📤 Executing direct A0GI transfer...[/yellow]")
+        # Execute direct payment for validation
+        rprint(f"\n[cyan]💰 Direct {self.payment_token_symbol} Payment for validation:[/cyan]")
+        rprint(f"[yellow]📤 Executing direct {self.payment_token_symbol} transfer...[/yellow]")
         
-        validation_payment_result = self.charlie_sdk.execute_payment(
-            to_agent="Bob",
-            amount=0.00005,  # 0.00005 A0GI for validation (small amount for demo)
-            service_type="validation"
-        )
-        
-        rprint(f"[green]💳 Payment Successful[/green]")
-        rprint(f"   From: Charlie → Bob")
-        rprint(f"   Amount: {validation_payment_result.amount:.4f} A0GI")
-        rprint(f"   Transaction: {validation_payment_result.transaction_hash}")
-        val_tx_hash = validation_payment_result.transaction_hash if validation_payment_result.transaction_hash.startswith('0x') else f"0x{validation_payment_result.transaction_hash}"
-        rprint(f"   Explorer: https://chainscan-galileo.0g.ai/tx/{val_tx_hash}")
+        payment_receipt = self._get_latest_bob_payment_receipt()
+        validation_payment_result = payment_receipt.get("proof") if payment_receipt else None
+        if payment_receipt:
+            rprint(f"[green]💳 Settlement already executed: {payment_receipt['tx_hash']}[/green]")
+            rprint(f"   Amount: {payment_receipt['amount']} {payment_receipt['currency']}")
+        else:
+            rprint(f"[yellow]⚠️  No settlement receipt available; Bob operating pro bono[/yellow]")
         
         # Store validation report on IPFS with payment proof
-        enhanced_validation_data = {
-            **validation_result,
-            "payment_proof": {
+        payment_proof_payload = None
+        if validation_payment_result:
+            payment_proof_payload = {
                 "payment_id": validation_payment_result.payment_id,
                 "transaction_hash": validation_payment_result.transaction_hash,
                 "amount": validation_payment_result.amount,
                 "currency": validation_payment_result.currency
-            },
-            "x402_enhanced": True
+            }
+        enhanced_validation_data = {
+            **validation_result,
+            "payment_proof": payment_proof_payload,
+            "x402_enhanced": bool(payment_proof_payload)
         }
         
         validation_cid = self.bob_sdk.store_evidence(enhanced_validation_data, "validation")
@@ -1266,17 +1520,32 @@ Respond in JSON format with fields: product_name, price, color, quality_score, v
         print(f"   Validator: {validation_result.get('validator', 'Bob')}")
         
         # Bob submits validation response on-chain (non-blocking)
-        tx_hash = "demo_feedback_skipped"  # Default value
-        try:
-            import hashlib
-            data_hash = "0x" + hashlib.sha256(analysis_cid.encode()).hexdigest()
-            
-            # Submit actual validation response with score via ValidationRegistry
-            tx_hash = self.bob_sdk.submit_validation_response(data_hash, score)
-            print(f"✅ Validation response submitted on-chain: {tx_hash}")
-        except Exception as e:
-            print(f"⚠️  Validation response failed (continuing demo): {e}")
-            # Continue demo even if validation fails
+        skip_chain_submission = os.getenv("GENESIS_SKIP_VALIDATION_RESPONSE", "1").lower() not in ("0", "false", "no")
+        if skip_chain_submission:
+            tx_hash = "validation_response_simulated"
+            self.results.setdefault("validation_response", {
+                "simulated": True,
+                "reason": "GENESIS_SKIP_VALIDATION_RESPONSE enabled"
+            })
+        else:
+            try:
+                import hashlib
+                if analysis_cid:
+                    data_hash = "0x" + hashlib.sha256(analysis_cid.encode()).hexdigest()
+                else:
+                    serialized_analysis = json.dumps(analysis_data, sort_keys=True)
+                    data_hash = "0x" + hashlib.sha256(serialized_analysis.encode()).hexdigest()
+                
+                # Submit actual validation response with score via ValidationRegistry
+                tx_hash = self.bob_sdk.submit_validation_response(data_hash, score)
+                print(f"✅ Validation response submitted on-chain: {tx_hash}")
+            except Exception as e:
+                print(f"⚠️  Validation response failed (continuing demo): {e}")
+                tx_hash = "demo_validation_response"
+                self.results.setdefault("validation_response", {
+                    "simulated": True,
+                    "error": str(e)
+                })
         
         rprint(f"[green]🔍 Validation Response Submitted[/green]")
         rprint(f"   Validator: Bob")
@@ -1298,58 +1567,27 @@ Respond in JSON format with fields: product_name, price, color, quality_score, v
     def _create_enhanced_evidence_package(self) -> Dict[str, Any]:
         """Create enhanced evidence package with Triple-Verified Stack proofs"""
         
-        # Gather all payment receipts (both AP2 and x402)
-        payment_receipts = []
-        
-        # AP2 payment proof
-        if "dual_payment" in self.results and "ap2_payment_proof" in self.results["dual_payment"]:
-            ap2_proof = self.results["dual_payment"]["ap2_payment_proof"]
-            
-            # Get confirmation code safely
-            confirmation_code = "N/A"
-            if hasattr(ap2_proof, 'transaction_details') and ap2_proof.transaction_details:
-                confirmation_code = ap2_proof.transaction_details.get("confirmation_code", "N/A")
-            elif hasattr(ap2_proof, 'proof_id'):
-                confirmation_code = f"AP2_{ap2_proof.proof_id[:8]}"
+        payment_receipts: List[Any] = []
+        settlements = self.results.get("alice_bob_payments", {}).get("runs", [])
+        for entry in settlements:
+            if entry.get("status") != "success":
+                continue
+            proof_obj = entry.get("proof")
+            if proof_obj:
+                payment_receipts.append(proof_obj)
             else:
-                confirmation_code = "AP2_PAYMENT_COMPLETED"
-            
-            # Get payment ID safely
-            payment_id = "N/A"
-            if hasattr(ap2_proof, 'proof_id'):
-                payment_id = ap2_proof.proof_id
-            elif hasattr(ap2_proof, 'cart_mandate_id'):
-                payment_id = ap2_proof.cart_mandate_id
-            
-            payment_receipts.append({
-                "type": "ap2_universal",
-                "payment_id": payment_id,
-                "amount": self.results["dual_payment"]["ap2_amount"],
-                "confirmation": confirmation_code,
-                "payment_method": "ap2_universal"
-            })
-        
-        # x402 crypto payment receipt
-        if "dual_payment" in self.results and "x402_payment_result" in self.results["dual_payment"]:
-            x402_result = self.results["dual_payment"]["x402_payment_result"]
-            payment_receipts.append({
-                "payment_id": x402_result.payment_id,
-                "transaction_hash": x402_result.transaction_hash,
-                "amount": x402_result.amount,
-                "currency": x402_result.currency,
-                "payment_method": str(x402_result.payment_method)
-            })
-        
-        # Validation payment receipt
-        if "validation" in self.results and "x402_payment" in self.results["validation"]:
-            validation_payment = self.results["validation"]["x402_payment"]
-            payment_receipts.append({
-                "payment_id": validation_payment.payment_id,
-                "transaction_hash": validation_payment.transaction_hash,
-                "amount": validation_payment.amount,
-                "currency": validation_payment.currency,
-                "payment_method": str(validation_payment.payment_method)
-            })
+                payment_receipts.append({
+                    "payment_id": entry.get("payment_id"),
+                    "transaction_hash": entry.get("tx_hash"),
+                    "amount": entry.get("amount"),
+                    "currency": entry.get("currency"),
+                    "payment_method": "x402",
+                    "from_agent": self.alice_agent.agent_name,
+                    "to_agent": self.bob_agent.agent_name
+                })
+        validation_payment = self.results.get("validation", {}).get("x402_payment")
+        if validation_payment:
+            payment_receipts.append(validation_payment)
         
         # Create comprehensive Triple-Verified Stack evidence package
         storage_result = self.results.get("storage_analysis", {})
@@ -1365,13 +1603,12 @@ Respond in JSON format with fields: product_name, price, color, quality_score, v
             "triple_verified_stack": {
                 "layer_1_ap2_intent": self.results.get("ap2_intent", {}).get("verified", True),
                 "layer_2_process_integrity": self.results.get("process_integrity_proof", {}).get("proof_id") if self.results.get("process_integrity_proof") else "verified",
-                "layer_3_x402_settlement": self.results.get("0g_payment", {}).get("triple_verified", True),
+                "layer_3_x402_settlement": self.results.get("alice_bob_payments", {}).get("successes", 0) > 0,
                 "verification_layers_completed": 3
             }
         }
         
         # Convert payment receipts to SDK format
-        import time
         from chaoschain_sdk.types import PaymentProof, PaymentMethod
         payment_proofs = []
         for receipt in payment_receipts:
@@ -1379,8 +1616,8 @@ Respond in JSON format with fields: product_name, price, color, quality_score, v
                 from datetime import datetime
                 payment_proofs.append(PaymentProof(
                     payment_id=receipt.get("payment_id", "unknown"),
-                    from_agent=receipt.get("from_agent", "Charlie"),
-                    to_agent=receipt.get("to_agent", "Alice"),
+                    from_agent=receipt.get("from_agent", "Alice"),
+                    to_agent=receipt.get("to_agent", "Bob"),
                     amount=receipt.get("amount", 0),
                     currency=receipt.get("currency", "USDC"),
                     payment_method=PaymentMethod.A2A_X402,
@@ -1412,476 +1649,100 @@ Respond in JSON format with fields: product_name, price, color, quality_score, v
         
         return evidence_package
     
-    def _store_enhanced_evidence_package(self, evidence_package: Dict[str, Any]) -> str:
-        """Store enhanced evidence package on 0G Storage"""
-        
-        if not self.zg_storage or not self.zg_storage.is_available:
-            rprint(f"[yellow]⚠️  0G Storage not available - continuing without storage[/yellow]")
-            rprint(f"[yellow]   Enhanced evidence package data preserved in memory for demo[/yellow]")
-            
-            self.results["enhanced_evidence"] = {
-                "success": False,
-                "root_hash": None,
-                "uri": "No storage available",
-                "note": "Demo continued without 0G Storage"
-            }
+    def _store_enhanced_evidence_package(self, evidence_package: Dict[str, Any]) -> Optional[str]:
+        """Store enhanced evidence package via ChaosChain SDK storage."""
+        if not self.alice_sdk:
             return None
-        
         try:
-            # Store on 0G Storage using gRPC
-            result = self.zg_storage.put(
-                blob=str(evidence_package).encode(),
-                mime="application/json",
-                idempotency_key=f"enhanced_evidence_{int(time.time())}"
-            )
-            
-            if result.success:
-                root_hash = result.metadata.get("root_hash", result.hash)
-                tx_hash = result.metadata.get("tx_hash", "")
-                
-                rprint(f"[green]📦 Enhanced Evidence Package uploaded to 0G Storage[/green]")
-                rprint(f"   Root Hash: {root_hash}")
-                rprint(f"   TX Hash: {tx_hash}")
-                rprint(f"   URI: {result.uri}")
-                
-                self.results["enhanced_evidence"] = {
-                    "success": True,
-                    "root_hash": root_hash,
-                    "tx_hash": tx_hash,
-                    "uri": result.uri,
-                    "payment_proofs_included": len(evidence_package.get("payment_proofs", []))
-                }
-                return root_hash
-            else:
-                rprint(f"[yellow]⚠️  0G Storage failed: {result.error}[/yellow]")
-                self.results["enhanced_evidence"] = {
-                    "success": False,
-                    "error": result.error
-                }
-                return None
-                
-        except Exception as e:
-            rprint(f"[yellow]⚠️  0G Storage error: {e}[/yellow]")
-            rprint(f"[yellow]   Enhanced evidence package data preserved in memory for demo[/yellow]")
-            
+            cid = self.alice_sdk.store_evidence(evidence_package, "enhanced-evidence")
+            rprint("[green]📦 Enhanced evidence stored via ChaosChain SDK[/green]")
+            rprint(f"   Evidence CID: {cid}")
+            self.results["enhanced_evidence"] = {
+                "success": True,
+                "cid": cid,
+                "payment_proofs_included": len(evidence_package.get("payment_proofs", [])),
+                "tx_hash": None
+            }
+            return cid
+        except Exception as exc:
+            rprint(f"[yellow]⚠️  Enhanced evidence storage skipped: {exc}[/yellow]")
             self.results["enhanced_evidence"] = {
                 "success": False,
-                "error": str(e),
-                "note": "Demo continued without storage"
+                "error": str(exc),
+                "payment_proofs_included": len(evidence_package.get("payment_proofs", []))
             }
             return None
-    
+
     def _display_final_summary(self):
-        """Display the final success summary with x402 enhancements"""
-        
-        print("DEBUG: _display_final_summary method called")
-        
-        # Extract payment info for use throughout method
-        validation_payment_obj = self.results.get("validation", {}).get("x402_payment")
-        if validation_payment_obj and hasattr(validation_payment_obj, 'amount'):
-            validation_amount = validation_payment_obj.amount
-            validation_tx = validation_payment_obj.transaction_hash or ""
+        """Display final summary focusing on agent IDs, Eigen usage, and settlements."""
+        overall_runtime = time.perf_counter() - (self._demo_start or time.perf_counter())
+        console = self.console
+        console.print("\n[bold blue]📋 FINAL SUMMARY[/bold blue]")
+        summary_table = Table(show_header=True, header_style="bold cyan")
+        summary_table.add_column("Item", style="white")
+        summary_table.add_column("Details", style="green")
+        summary_table.add_column("Tx / Evidence", style="magenta")
+
+        registration_agents = self.results.get("registration", {}).get("agents", {})
+        wallets = self.results.get("wallets", {})
+        if registration_agents:
+            for name, metadata in registration_agents.items():
+                agent_id = metadata.get("agent_id", "N/A")
+                tx_hash = metadata.get("tx_hash", "N/A")
+                wallet = wallets.get(name, "N/A")
+                summary_table.add_row(
+                    f"Agent {name}",
+                    f"ID {agent_id} — Wallet {wallet}",
+                    tx_hash or "N/A"
+                )
         else:
-            validation_amount = 0
-            validation_tx = ""
-            
-        # Extract ALL payment info at the beginning for consistent access throughout method
-        dual_payment = self.results.get("dual_payment", {})
-        analysis_payment_obj = dual_payment.get('x402_payment_result')
-        analysis_tx = ""
-        if analysis_payment_obj and hasattr(analysis_payment_obj, 'transaction_hash'):
-            analysis_tx = analysis_payment_obj.transaction_hash or ""
-        
-        # Extract payment amounts for consistent use throughout method
-        print(f"DEBUG: dual_payment = {dual_payment}")
-        analysis_amount = dual_payment.get('x402_amount', 0)
-        ap2_amount = dual_payment.get('ap2_amount', 0)
-        analysis_payment_id = analysis_payment_obj.payment_id[:20] if analysis_payment_obj and hasattr(analysis_payment_obj, 'payment_id') else 'N/A'
-        validation_payment_id = validation_tx[:20] if validation_tx else 'N/A'
-        print(f"DEBUG: analysis_amount = {analysis_amount}, ap2_amount = {ap2_amount}")
-        
-        # Prepare summary data
-        summary_data = {
-            "Agent Registration": {
-                "success": self.results.get("registration", {}).get("success", False),
-                "details": f"Alice, Bob, Charlie registered with on-chain IDs and x402 payment support",
-                "tx_hashes": {name: data.get("tx_hash") for name, data in self.results.get("registration", {}).get("agents", {}).items() if "tx_hash" in data}
-            },
-            "0G Storage": {
-                "success": self.results.get("storage_analysis", {}).get("success", False),
-                "details": "Analysis and evidence packages stored on 0G Storage",
-                "storage": {
-                    "analysis": self.results.get("storage_analysis", {}).get("uri", "N/A"),
-                    "root_hash": self.results.get("storage_analysis", {}).get("root_hash", "N/A")
-                }
-            },
-            "x402 Payments (A0GI)": {
-                "success": self.results.get("0g_payment", {}).get("x402_success", False),
-                "details": f"Agent-to-agent x402 payments in A0GI tokens (0G native currency)",
-                "payments": {
-                    "Analysis Payment": f"{self.results.get('0g_payment', {}).get('amount', 0):.4f} A0GI (Charlie → Alice)",
-                    "Validation Payment": f"{self.results.get('validation', {}).get('x402_payment', type('obj', (), {'amount': 0.001})).amount:.4f} A0GI (Charlie → Bob)" if self.results.get('validation', {}).get('x402_payment') else "0.001 A0GI (Charlie → Bob)",
-                    "Currency": "A0GI (0G native tokens)",
-                    "Protocol": "x402 v0.2.1+",
-                    "Triple-Verified Stack": "✅ Complete"
-                }
-            },
-            "Enhanced Evidence": {
-                "success": self.results.get("enhanced_evidence", {}).get("success", False),
-                "details": "Evidence packages enhanced with x402 payment proofs for PoA verification",
-                "payment_proofs": self.results.get("enhanced_evidence", {}).get("payment_proofs_included", 0)
-            }
-        }
-        
-        # Display final summary using rich
-        rprint("\n[bold blue]📋 FINAL SUMMARY[/bold blue]")
-        rprint("=" * 60)
-        
-        for component, details in summary_data.items():
-            status = "[green]✅ SUCCESS[/green]" if details["success"] else "[red]❌ FAILED[/red]"
-            rprint(f"\n[bold]{component}[/bold]: {status}")
-            rprint(f"   {details['details']}")
-            
-            if "tx_hashes" in details:
-                for name, tx_hash in details["tx_hashes"].items():
-                    if tx_hash:
-                        rprint(f"   {name}: {tx_hash}")
-            
-            if "cids" in details:
-                for name, cid in details["cids"].items():
-                    if cid:
-                        rprint(f"   {name}: {cid}")
-            
-            if "payments" in details:
-                for payment_name, payment_info in details["payments"].items():
-                    rprint(f"   {payment_name}: {payment_info}")
-        
-        # ✅ (D) Display EigenCompute TEE Details
-        payment_result = self.results.get("0g_payment", {})
-        if payment_result.get("proof_cid"):
-            rprint(f"\n[bold cyan]🔐 EigenCompute Process Integrity[/bold cyan]: [green]✅ VERIFIED[/green]")
-            rprint(f"   Docker Digest: sha256:00a3561a5aaa83c696b222cad0d1d0564c33614024e04e2b054b4cacce767ae8")
-            rprint(f"   Enclave Wallet: 0x05d39048EDB42183ABaf609f4D5eda3A2a2eDcA3")
-            rprint(f"   ProcessProof CID: {payment_result['proof_cid']}")
-            if payment_result.get("exec_hash"):
-                rprint(f"   Execution Hash: 0x{payment_result['exec_hash'][:32]}...")
-            rprint(f"   🎯 Payment linked to verifiable TEE execution")
-        
-        # Add x402 Payment Monitoring & Observability
-        self._display_x402_monitoring_summary()
-    
-    def _display_x402_monitoring_summary(self):
-        """Display x402 payment monitoring and observability metrics"""
-        
-        rprint("\n[bold cyan]📊 x402 PAYMENT MONITORING & OBSERVABILITY[/bold cyan]")
-        rprint("=" * 60)
-        
-        try:
-            # Extract actual payment data from demo results
-            payment_data = self._extract_x402_payment_data_from_results()
-            
-            rprint(f"\n[bold green]🔍 x402 Protocol Verification[/bold green]")
-            rprint(f"   Protocol: x402 v0.2.1+ (Coinbase Official)")
-            rprint(f"   Network: 0g-testnet")
-            rprint(f"   Treasury: 0x20E7B2A2c8969725b88Dd3EF3a11Bc3353C83F70")
-            rprint(f"   Protocol Fee: 2.5%")
-            rprint(f"   Currency: A0GI (0G native tokens)")
-            rprint(f"   Settlement Mode: Direct A0GI transfers (2 transactions per payment)")
-            
-            rprint(f"\n[bold green]💳 Payment Performance Metrics[/bold green]")
-            if payment_data['total_payments'] > 0:
-                success_rate = (payment_data['successful_payments'] / payment_data['total_payments']) * 100
-                rprint(f"   Success Rate: [green]{success_rate:.1f}%[/green]")
-                rprint(f"   Total Payments: {payment_data['total_payments']}")
-                rprint(f"   Total Volume: [green]{payment_data['total_volume']:.4f} A0GI[/green]")
-                rprint(f"   Protocol Fees Collected: [green]{payment_data['total_fees']:.6f} A0GI[/green]")
-                rprint(f"   Net Amount to Providers: [green]{payment_data['net_to_providers']:.6f} A0GI[/green]")
-            else:
-                rprint(f"   [yellow]No x402 payments in current session[/yellow]")
-            
-            # Multi-Agent x402 Transaction Details
-            rprint(f"\n[bold green]🔗 x402 Transaction Architecture[/bold green]")
-            rprint(f"   Each x402 payment creates [bold]2 separate A0GI transactions[/bold]:")
-            rprint(f"   1️⃣  Protocol Fee → ChaosChain Treasury (2.5% in A0GI)")
-            rprint(f"   2️⃣  Net Payment → Service Provider (97.5% in A0GI)")
-            
-            # Agent-level statistics from demo results
-            rprint(f"\n[bold green]👥 Agent Payment Statistics[/bold green]")
-            
-            # Analysis payment (Charlie → Alice)
-            analysis_payment = self.results.get("analysis", {}).get("dual_payment", {})
-            if analysis_payment.get("x402_payment_result"):
-                payment = analysis_payment["x402_payment_result"]
-                protocol_fee = payment.receipt_data.get("protocol_fee", 0)
-                net_amount = payment.receipt_data.get("net_amount", payment.amount)
-                
-                rprint(f"   🔧 Alice (Server Agent):")
-                rprint(f"     Service: AI Smart Shopping Analysis (0G Compute)")
-                rprint(f"     Received: [green]{net_amount:.6f} A0GI[/green] (net)")
-                rprint(f"     Protocol Fee: [yellow]{protocol_fee:.6f} A0GI[/yellow] → Treasury")
-                rprint(f"     Fee TX: {payment.receipt_data.get('protocol_fee_tx', 'N/A')[:20]}...")
-                rprint(f"     Main TX: {payment.transaction_hash[:20]}...")
-            
-            # Validation payment (Charlie → Bob)
-            validation_payment = self.results.get("validation", {}).get("x402_payment")
-            if validation_payment:
-                protocol_fee = validation_payment.receipt_data.get("protocol_fee", 0)
-                net_amount = validation_payment.receipt_data.get("net_amount", validation_payment.amount)
-                
-                rprint(f"   🔍 Bob (Validator Agent):")
-                rprint(f"     Service: Quality Validation (0G Compute)")
-                rprint(f"     Received: [green]{net_amount:.6f} A0GI[/green] (net)")
-                rprint(f"     Protocol Fee: [yellow]{protocol_fee:.6f} A0GI[/yellow] → Treasury")
-                rprint(f"     Main TX: {validation_payment.transaction_hash[:20]}...")
-            
-            # Charlie's payment summary
-            total_sent = 0
-            total_fees = 0
-            if analysis_payment.get("x402_payment_result"):
-                payment = analysis_payment["x402_payment_result"]
-                total_sent += payment.amount
-                total_fees += payment.receipt_data.get("protocol_fee", 0)
-            if validation_payment:
-                total_sent += validation_payment.amount
-                total_fees += validation_payment.receipt_data.get("protocol_fee", 0)
-                
-            if total_sent > 0:
-                rprint(f"   💳 Charlie (Client Agent):")
-                rprint(f"     Services Purchased: Smart Shopping + Validation")
-                rprint(f"     Total Sent: [red]{total_sent:.4f} A0GI[/red]")
-                rprint(f"     Protocol Fees Paid: [yellow]{total_fees:.6f} A0GI[/yellow]")
-            
-            # Treasury fee collection summary
-            if total_fees > 0:
-                rprint(f"\n[bold green]🏦 ChaosChain Treasury Collection[/bold green]")
-                rprint(f"   Total Fees Collected: [green]{total_fees:.6f} A0GI[/green]")
-                rprint(f"   Fee Percentage: 2.5% of all x402 payments")
-                rprint(f"   Currency: A0GI (0G native tokens)")
-                rprint(f"   Treasury Address: 0x20E7B2A2c8969725b88Dd3EF3a11Bc3353C83F70")
-                rprint(f"   Revenue Model: Automatic fee collection on every x402 payment")
-            
-            rprint(f"\n[bold green]🎯 x402 Benefits Demonstrated[/bold green]")
-            rprint(f"   ✅ Frictionless agent-to-agent payments in A0GI")
-            rprint(f"   ✅ Cryptographic payment receipts for PoA")
-            rprint(f"   ✅ Dual-transaction architecture (fee + payment)")
-            rprint(f"   ✅ Automatic protocol fee collection (2.5% to ChaosChain)")
-            rprint(f"   ✅ Enhanced evidence packages with payment proofs")
-            rprint(f"   ✅ Production-ready A0GI settlement on 0G Testnet")
-            rprint(f"   ✅ Native integration with 0G Compute & Storage")
-            
-        except Exception as e:
-            rprint(f"[yellow]⚠️  x402 monitoring unavailable: {e}[/yellow]")
-            rprint(f"   This is expected if no payments were made in this session")
-    
-    def _extract_x402_payment_data_from_results(self):
-        """Extract x402 payment data from demo results for monitoring"""
-        
-        total_payments = 0
-        successful_payments = 0
-        total_volume = 0.0
-        total_fees = 0.0
-        net_to_providers = 0.0
-        
-        # Analysis payment (Charlie → Alice)
-        analysis_payment = self.results.get("analysis", {}).get("dual_payment", {})
-        if analysis_payment.get("x402_payment_result"):
-            payment = analysis_payment["x402_payment_result"]
-            total_payments += 1
-            successful_payments += 1
-            total_volume += payment.amount
-            protocol_fee = payment.receipt_data.get("protocol_fee", 0)
-            net_amount = payment.receipt_data.get("net_amount", payment.amount)
-            total_fees += protocol_fee
-            net_to_providers += net_amount
-        
-        # Validation payment (Charlie → Bob)
-        validation_payment = self.results.get("validation", {}).get("x402_payment")
-        if validation_payment:
-            total_payments += 1
-            successful_payments += 1
-            total_volume += validation_payment.amount
-            protocol_fee = validation_payment.receipt_data.get("protocol_fee", 0)
-            net_amount = validation_payment.receipt_data.get("net_amount", validation_payment.amount)
-            total_fees += protocol_fee
-            net_to_providers += net_amount
-        
-        return {
-            "total_payments": total_payments,
-            "successful_payments": successful_payments,
-            "total_volume": total_volume,
-            "total_fees": total_fees,
-            "net_to_providers": net_to_providers
-        }
-    
-    def _print_final_success_summary(self):
-        """Print the beautiful final success summary table with x402 enhancements"""
-        
-        from rich.table import Table
-        from rich.align import Align
-        from rich import print as rprint
-        
-        # Create the main success banner
-        success_banner = """
-🎉 **CHAOSCHAIN GENESIS STUDIO TRIPLE-VERIFIED STACK COMPLETE!** 🚀
+            summary_table.add_row("Agents", "Registration data unavailable", "N/A")
 
-✅ **FULL END-TO-END TRIPLE-VERIFIED COMMERCIAL PROTOTYPE SUCCESSFUL!**
+        compute_meta = self.results.get("compute_providers", {})
+        process_proof = self.results.get("process_integrity_proof") or {}
+        eigen_detail = (
+            f"Alice:{compute_meta.get('alice', 'N/A')} | "
+            f"Bob:{compute_meta.get('bob', 'N/A')} | "
+            f"Job ID: {process_proof.get('job_id', 'N/A')}"
+        )
+        process_error = self.results.get("process_integrity_error")
+        if process_error:
+            eigen_detail = f"{eigen_detail} | {process_error}"
+        summary_table.add_row(
+            "Eigen Stack Verification",
+            eigen_detail,
+            process_proof.get("execution_hash", "N/A")
+        )
 
-The complete lifecycle of trustless agentic commerce with Triple-Verified Stack:
-• ERC-8004 Foundation: Identity, Reputation, and Validation registries ✅
-• AP2 Intent Verification: Cryptographic proof of user authorization ✅
-• ChaosChain Process Integrity: Verifiable proof of correct code execution ✅
-• ChaosChain Adjudication: Quality assessment and evidence storage ✅
-• Dual Payment Protocols: AP2 universal + x402 crypto settlement ✅
-• Enhanced Evidence Packages with all verification proofs ✅
-
-🚀 **ChaosChain owns 2 out of 3 verification layers!**
-        """
-        
-        banner_panel = Panel(
-            Align.center(success_banner),
-            title="[bold green]🏆 TRIPLE-VERIFIED STACK DEMO COMPLETE 🏆[/bold green]",
-            border_style="green",
-            padding=(1, 2)
-        )
-        
-        rprint(banner_panel)
-        rprint()
-        
-        # Create the results table
-        table = Table(title="[bold cyan]🚀 ChaosChain Genesis Studio x402 - Final Results Summary[/bold cyan]", 
-                     show_header=True, header_style="bold magenta", border_style="cyan")
-        
-        table.add_column("Component", style="bold white", width=25)
-        table.add_column("Status", style="bold", width=12)
-        table.add_column("Details", style="cyan", width=45)
-        table.add_column("Transaction/Link", style="yellow", width=35)
-        
-        # Agent Registration Results
-        table.add_row(
-            "🤖 Agent Registration",
-            "[green]✅ SUCCESS[/green]",
-            f"Alice (ID: {self.alice_sdk.get_agent_id()}), Bob (ID: {self.bob_sdk.get_agent_id()}), Charlie (ID: {self.charlie_sdk.get_agent_id()}) with x402 support",
-            "ERC-8004 on Base Sepolia"
-        )
-        
-        # x402 Analysis Payment (A0GI)
-        payment_data = self.results.get("0g_payment", {})
-        analysis_amount = payment_data.get('amount', 0)
-        analysis_payment_obj = payment_data.get('x402_payment_result')
-        analysis_tx = ""
-        if analysis_payment_obj and hasattr(analysis_payment_obj, 'transaction_hash'):
-            analysis_tx = analysis_payment_obj.transaction_hash or ""
-        
-        table.add_row(
-            "💳 x402 Analysis Payment",
-            "[green]✅ SUCCESS[/green]" if payment_data.get('x402_success') else "[yellow]⚠️  SIMULATED[/yellow]",
-            f"{analysis_amount:.4f} A0GI: Charlie → Alice",
-            f"0x{analysis_tx[:20]}..." if analysis_tx and analysis_tx != "N/A" else "N/A"
-        )
-        
-        # x402 Validation Payment (A0GI)
-        validation_payment_obj = self.results.get("validation", {}).get("x402_payment")
-        if validation_payment_obj and hasattr(validation_payment_obj, 'amount'):
-            validation_amount = validation_payment_obj.amount
-            validation_tx = validation_payment_obj.transaction_hash or ""
+        payments = self.results.get("alice_bob_payments", {}).get("runs", [])
+        successful_payments = [entry for entry in payments if entry.get("status") == "success"]
+        if successful_payments:
+            for entry in successful_payments:
+                summary_table.add_row(
+                    f"Settlement #{entry['run']}",
+                    f"Alice → Bob {entry['amount']} {entry['currency']}",
+                    entry.get("tx_hash", "N/A")
+                )
         else:
-            validation_amount = 0.001  # Default
-            validation_tx = ""
-        
-        # Extract payment IDs for f-string
-        analysis_payment_id = analysis_payment_obj.payment_id[:20] if analysis_payment_obj and hasattr(analysis_payment_obj, 'payment_id') else 'N/A'
-        validation_payment_id = validation_tx[:20] if validation_tx else 'N/A'
-        
-        table.add_row(
-            "💳 x402 Validation Payment",
-            "[green]✅ SUCCESS[/green]" if validation_tx else "[yellow]⚠️  SIMULATED[/yellow]",
-            f"{validation_amount:.4f} A0GI: Charlie → Bob",
-            f"0x{validation_tx[:20]}..." if validation_tx and validation_tx != "N/A" else "N/A"
-        )
-        
-        # Enhanced Evidence Package
+            summary_table.add_row("Settlements", "No successful settlements recorded", "N/A")
+
         enhanced_evidence = self.results.get("enhanced_evidence", {})
-        table.add_row(
-            "📦 Enhanced Evidence",
-            "[green]✅ SUCCESS[/green]",
-            f"Evidence package with {enhanced_evidence.get('payment_proofs_included', 0)} payment proofs",
-            f"IPFS: {enhanced_evidence.get('cid', 'N/A')[:20]}..."
-        )
-        
-        # Validation Results
-        validation_score = self.results.get("validation", {}).get("score", 0)
-        table.add_row(
-            "🔍 PoA Validation",
-            "[green]✅ SUCCESS[/green]",
-            f"Score: {validation_score}/100 with payment verification",
-            f"Enhanced with x402 receipts"
-        )
-        
-        rprint(table)
-        rprint()
-        
-        # Payment amounts already extracted at the beginning of method
-        
-        # Create payment summary content as a string first
-        payment_summary_content = f"""[bold cyan]💳 x402 Payment Protocol Summary (A0GI):[/bold cyan]
+        if enhanced_evidence:
+            summary_table.add_row(
+                "Enhanced Evidence",
+                f"CID {enhanced_evidence.get('cid', 'N/A')}",
+                enhanced_evidence.get("cid", "N/A")
+            )
 
-[yellow]Smart Shopping Service Payment:[/yellow]
-• Amount: {analysis_amount:.4f} A0GI (x402 settlement)
-• From: Charlie → Alice
-• Service: AI Smart Shopping (0G Compute)
-• Currency: A0GI (0G native tokens)
-• Network: 0G Testnet
-• Payment ID: {analysis_payment_id}...
-
-[yellow]Validation Service Payment:[/yellow]
-• Amount: {validation_amount:.4f} A0GI  
-• From: Charlie → Bob
-• Service: Quality Validation (0G Compute)
-• Currency: A0GI (0G native tokens)
-• Network: 0G Testnet
-• Payment ID: {validation_payment_id}...
-
-[bold green]🎯 x402 Protocol Benefits:[/bold green]
-• Frictionless agent-to-agent payments in A0GI ✅
-• Cryptographic payment receipts for PoA ✅
-• No complex wallet setup required ✅
-• Instant settlement on 0G Testnet ✅
-• Enhanced evidence packages with payment proofs ✅
-• Native integration with 0G Network ✅
-
-[bold magenta]💰 Economic Impact:[/bold magenta]
-• Alice earned {analysis_amount:.4f} A0GI for loan evaluation service
-• Bob earned {validation_amount:.4f} A0GI for audit service
-• Charlie received autonomous loan decision with TEE-verified creditworthiness evaluation
-• Complete audit trail for trustless autonomous lending established
-• All transactions in 0G native tokens (A0GI)
-
-[bold red]🔧 Next Steps:[/bold red]
-• Enhanced evidence packages with payment proofs
-• Multi-agent autonomous lending workflows
-• Cross-chain x402 payment support with 0G Bridge"""
-
-        # Create and display the panel
-        payment_summary_panel = Panel(
-            payment_summary_content,
-            title="[bold green]🌟 x402 Commercial Success Metrics[/bold green]",
-            border_style="green"
-        )
-        
-        rprint(payment_summary_panel)
-
+        console.print(summary_table)
+        console.print(f"\nTotal Runtime: {overall_runtime:.2f}s")
+        console.print("Eigen AI + Eigen Compute proofs linked above ensure deterministic execution.")
+    
 
 def main():
-    """Main entry point for 0G-integrated Genesis Studio"""
+    """Main entry point for the Eigen-integrated Genesis Studio"""
     
-    # Check if we're on the correct network
-    network = os.getenv("NETWORK", "local")
-    if network != "0g-testnet":
-        print("⚠️  Warning: This demo is designed for 0G Testnet.")
-        print("   Please set NETWORK=0g-testnet in your .env file.")
-        print()
-    
-    # Initialize and run the 0G-integrated orchestrator
+    # Initialize and run the orchestrator
     orchestrator = GenesisStudioX402Orchestrator()
     orchestrator.run_complete_demo()
 
