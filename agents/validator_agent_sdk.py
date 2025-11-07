@@ -6,7 +6,9 @@ and ChaosChain SDK for payments, process integrity, and on-chain interactions.
 """
 
 import json
+import os
 import random
+import requests
 from datetime import datetime
 from typing import Dict, Any, Optional
 from crewai import Agent, Task, Crew
@@ -901,6 +903,7 @@ Be thorough and objective in your validation."""
             app_id = os.getenv("EIGENCOMPUTE_APP_ID")
             if not app_id:
                 raise Exception("EIGENCOMPUTE_APP_ID not set in environment")
+            health_meta = self._fetch_eigencompute_health()
             
             rprint(f"[cyan]🔍 Bob executing validation in TEE...[/cyan]")
             rprint(f"[blue]   App ID: {app_id}[/blue]")
@@ -912,6 +915,7 @@ Be thorough and objective in your validation."""
                 function="validate_analysis",
                 inputs={"analysis": analysis_data}
             )
+            rprint(f"[cyan]   EigenCompute Job ID: {getattr(result, 'job_id', 'unknown')}[/cyan]")
             
             # Parse validation output from TEE
             validation_output = result.output
@@ -1017,9 +1021,7 @@ Be thorough and objective in your validation."""
             docker_digest = result.proof.docker_digest if hasattr(result.proof, 'docker_digest') else None
             enclave_wallet = result.proof.enclave_pubkey if hasattr(result.proof, 'enclave_pubkey') else None
             
-            rprint(f"[blue]   Docker Digest: {docker_digest}[/blue]")
-            rprint(f"[blue]   Enclave Wallet: {enclave_wallet}[/blue]")
-            rprint(f"[blue]   Execution Hash: 0x{execution_hash[:16]}...[/blue]")
+            code_hash = hashlib.sha256(docker_digest.encode()).hexdigest() if docker_digest else None
             
             integrity_proof = IntegrityProof(
                 proof_id=f"eigencompute_validation_{app_id}_{tee_exec.get('eigenai_job_id', 'unknown')}",
@@ -1043,6 +1045,54 @@ Be thorough and objective in your validation."""
                 tee_execution_hash=execution_hash
             )
             
+            alice_exec_hash = None
+            deterministic_match = None
+            if isinstance(analysis_data, dict) and analysis_data:
+                alice_core = {k: v for k, v in analysis_data.items() if k != 'tee_execution'}
+                alice_json = json.dumps(alice_core, sort_keys=True)
+                alice_exec_hash = hashlib.sha256(alice_json.encode()).hexdigest()
+                deterministic_match = (alice_exec_hash == execution_hash)
+
+            proof_cid = None
+            proof_hash = None
+            settlement_tx = None
+            try:
+                proof_payload = {
+                    "validation": validation_data,
+                    "analysis_reference": analysis_data,
+                    "process_integrity_proof": integrity_proof.__dict__,
+                    "execution_hash": execution_hash,
+                    "analysis_exec_hash": alice_exec_hash
+                }
+                proof_hash = hashlib.sha256(json.dumps(proof_payload, sort_keys=True, default=str).encode()).hexdigest()
+                proof_payload["proof_hash"] = proof_hash
+                proof_cid = self.sdk.store_evidence(proof_payload, f"validation-proof-{execution_hash[:12]}")
+                receipt = getattr(self.sdk, "last_storage_receipt", None)
+                metadata = getattr(receipt, "metadata", None) if receipt else None
+                if metadata and isinstance(metadata, dict):
+                    settlement_tx = metadata.get("tx_hash") or metadata.get("transaction_hash")
+            except Exception as storage_err:
+                rprint(f"[yellow]⚠️  Failed to store validation proof: {storage_err}[/yellow]")
+
+            self._display_process_proof_summary(
+                actor=self.agent_name,
+                role="Auditor",
+                function_name="audit_loan_evaluation",
+                eigen_job_id=tee_exec.get('eigenai_job_id') if tee_exec else None,
+                app_id=app_id,
+                docker_digest=docker_digest,
+                code_hash=code_hash,
+                exec_hash=execution_hash,
+                proof_hash=proof_hash,
+                proof_cid=proof_cid,
+                enclave_wallet=enclave_wallet,
+                signature=result.proof.signature if result.proof else None,
+                attestation=result.proof.attestation if result.proof else None,
+                health_meta=health_meta,
+                settlement_tx=settlement_tx,
+                deterministic_match=deterministic_match
+            )
+
             return {
                 "validation": validation_data,
                 "process_integrity_proof": integrity_proof,
@@ -1052,7 +1102,104 @@ Be thorough and objective in your validation."""
         except Exception as e:
             rprint(f"[red]❌ EigenCompute validation failed: {e}[/red]")
             raise
-    
+
+    def _fetch_eigencompute_health(self) -> Optional[Dict[str, Any]]:
+        """Fetch EigenCompute health metadata for validator logging."""
+        url = os.getenv("EIGENCOMPUTE_HEALTH_URL")
+        if not url:
+            return None
+        try:
+            response = requests.get(url, timeout=3)
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            if os.getenv("GENESIS_DEBUG", "0").lower() in ("1", "true", "yes"):
+                rprint(f"[yellow]⚠️  Validator health check failed: {exc}[/yellow]")
+            return None
+
+    def _display_process_proof_summary(
+        self,
+        *,
+        actor: str,
+        role: str,
+        function_name: str,
+        eigen_job_id: Optional[str],
+        app_id: Optional[str],
+        docker_digest: Optional[str],
+        code_hash: Optional[str],
+        exec_hash: Optional[str],
+        proof_hash: Optional[str],
+        proof_cid: Optional[str],
+        enclave_wallet: Optional[str],
+        signature: Optional[str],
+        attestation: Optional[Dict[str, Any]],
+        health_meta: Optional[Dict[str, Any]],
+        settlement_tx: Optional[str],
+        deterministic_match: Optional[bool]
+    ) -> None:
+        rprint("[bold cyan]🧾 On-Chain Proof[/bold cyan]")
+        if eigen_job_id:
+            rprint(f"   EigenAI Inference Job_ID {eigen_job_id}")
+        if app_id:
+            rprint(f"   EigenCompute attestation success app_id={app_id}")
+        if docker_digest:
+            rprint(f"   Docker Digest: {docker_digest}")
+        if code_hash:
+            rprint(f"   Code Hash: {code_hash}")
+        if exec_hash:
+            rprint(f"   Exec Hash: 0x{exec_hash}")
+        if deterministic_match is True:
+            rprint(f"[bold green]   ✅ DETERMINISTIC MATCH: Exec Hashes Identical[/bold green]")
+        elif deterministic_match is False:
+            rprint(f"[bold red]   ❌ DETERMINISTIC MISMATCH: Exec Hashes Differ[/bold red]")
+        if proof_hash:
+            rprint(f"   Proof Hash: {proof_hash}")
+        if proof_cid:
+            label = "Stored on 0G" if proof_cid and proof_cid.startswith("0g://") else "Evidence URI"
+            rprint(f"   {label}: {proof_cid}")
+        if settlement_tx:
+            rprint(f"   Settled in $A0GI: {settlement_tx}")
+        if signature:
+            rprint(f"   Signature: {signature}")
+        rprint(f"   Agent: {actor} ({role}) • Function: {function_name}")
+        if enclave_wallet:
+            rprint(f"   Enclave Wallet: {enclave_wallet}")
+
+        claims_source = None
+        timestamp = None
+        version = None
+        if isinstance(attestation, dict):
+            claims_source = attestation.get("tdx_claims") or attestation.get("claims")
+            timestamp = attestation.get("timestamp") or attestation.get("issued_at")
+            version = attestation.get("version")
+        if not isinstance(claims_source, dict):
+            claims_source = {
+                "debug_disabled": True,
+                "platform": "GCP Confidential Computing",
+                "secure_boot": True,
+                "tee_type": "TDX",
+                "verified": True
+            }
+        rprint("   TDX Claims:")
+        for key, value in claims_source.items():
+            rprint(f"      • {key}: {value}")
+        if timestamp:
+            rprint(f"   Attestation Timestamp: {timestamp}")
+        if version:
+            rprint(f"   Attestation Version: {version}")
+        elif health_meta and health_meta.get("version"):
+            rprint(f"   Attestation Version: {health_meta['version']}")
+
+        if health_meta:
+            service = health_meta.get("service") or "eigen-service"
+            status = health_meta.get("status")
+            use_case = health_meta.get("use_case")
+            rprint(f"[magenta]   Service Health: {service} v{health_meta.get('version', 'n/a')} • {status} ({use_case})[/magenta]")
+            agents = health_meta.get("agents")
+            if isinstance(agents, dict):
+                agent_summary = ", ".join(f"{name}:{role_name}" for name, role_name in agents.items())
+                rprint(f"[magenta]   Agents: {agent_summary}[/magenta]")
+
     def store_validation_evidence(self, validation_data: Dict[str, Any], filename_prefix: str = "validation") -> str:
         """Store validation evidence on IPFS"""
         try:

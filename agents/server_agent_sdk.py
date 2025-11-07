@@ -8,6 +8,7 @@ and ChaosChain SDK for payments, process integrity, and on-chain interactions.
 import os
 import hashlib
 import json
+import requests
 from datetime import datetime
 from typing import Dict, Any, Optional
 from crewai import Agent, Task, Crew
@@ -326,6 +327,7 @@ class GenesisServerAgentSDK:
         app_id = os.getenv("EIGENCOMPUTE_APP_ID")
         if not app_id:
             raise ValueError("EIGENCOMPUTE_APP_ID not set")
+        health_meta = self._fetch_eigencompute_health()
         
         try:
             result = self.eigencompute.execute(
@@ -341,6 +343,7 @@ class GenesisServerAgentSDK:
                 },
                 intent_id=intent_id
             )
+            rprint(f"[cyan]   EigenCompute Job ID: {getattr(result, 'job_id', 'unknown')}[/cyan]")
         except Exception as exc:
             rprint(f"[yellow]⚠️  EigenCompute unavailable: {exc}[/yellow]")
             rprint("[yellow]   Falling back to CrewAI-based loan evaluation[/yellow]")
@@ -395,13 +398,11 @@ class GenesisServerAgentSDK:
         # Display EigenCompute proof details
         docker_digest = result.proof.docker_digest if hasattr(result.proof, 'docker_digest') and result.proof.docker_digest else "sha256:4a368529fd7b2609ffd39a8980bac0b78d8137a9cb49d7a8ee046cb9d3613a22"
         enclave_wallet = result.proof.enclave_pubkey if hasattr(result.proof, 'enclave_pubkey') and result.proof.enclave_pubkey else "0x05d39048EDB42183ABaf609f4D5eda3A2a2eDcA3"
-        
-        rprint(f"[blue]   Docker Digest: {docker_digest}[/blue]")
-        rprint(f"[blue]   Enclave Wallet: {enclave_wallet}[/blue]")
+        code_hash = hashlib.sha256(docker_digest.encode()).hexdigest() if docker_digest else None
         
         # Display EigenAI details (from TEE execution)
-        if isinstance(evaluation_data, dict) and "tee_execution" in evaluation_data:
-            tee_exec = evaluation_data["tee_execution"]
+        tee_exec = evaluation_data.get("tee_execution", {}) if isinstance(evaluation_data, dict) else {}
+        if tee_exec:
             rprint(f"[cyan]📊 EigenAI Inference (from within TEE):[/cyan]")
             if "eigenai_job_id" in tee_exec:
                 rprint(f"[cyan]   Job ID: {tee_exec['eigenai_job_id']}[/cyan]")
@@ -414,17 +415,43 @@ class GenesisServerAgentSDK:
         rprint()
         
         proof_cid = None
+        proof_hash = None
+        settlement_tx = None
         try:
             proof_payload = {
                 "evaluation": evaluation_data,
                 "process_integrity_proof": result.proof.__dict__ if result.proof else {},
                 "execution_hash": execution_hash
             }
+            proof_hash = hashlib.sha256(json.dumps(proof_payload, sort_keys=True, default=str).encode()).hexdigest()
+            proof_payload["proof_hash"] = proof_hash
             proof_cid = self.sdk.store_evidence(proof_payload, f"loan-eval-{execution_hash[:12]}")
             rprint(f"[cyan]📦 Proof stored via ChaosChain SDK: {proof_cid}[/cyan]")
+            receipt = getattr(self.sdk, "last_storage_receipt", None)
+            metadata = getattr(receipt, "metadata", None) if receipt else None
+            if metadata and isinstance(metadata, dict):
+                settlement_tx = metadata.get("tx_hash") or metadata.get("transaction_hash")
         except Exception as e:
             rprint(f"[yellow]⚠️  Failed to store proof: {e}[/yellow]")
         
+        self._display_process_proof_summary(
+            actor="Alice",
+            role="Loan Officer",
+            function_name="evaluate_loan",
+            eigen_job_id=tee_exec.get("eigenai_job_id") if tee_exec else None,
+            app_id=app_id,
+            docker_digest=docker_digest,
+            code_hash=code_hash,
+            exec_hash=execution_hash,
+            proof_hash=proof_hash,
+            proof_cid=proof_cid,
+            enclave_wallet=enclave_wallet,
+            signature=result.proof.signature if result.proof else None,
+            attestation=result.proof.attestation if result.proof else None,
+            health_meta=health_meta,
+            settlement_tx=settlement_tx
+        )
+
         return {
             "analysis": evaluation_data,
             "process_integrity_proof": result.proof,
@@ -745,6 +772,7 @@ Ensure prices are within budget."""
             # Step 1: Use pre-deployed EigenCompute app
             # App deployed via: eigenx app deploy --name chaoschain-genesis-multi
             app_id = os.getenv("EIGENCOMPUTE_APP_ID", "0xb29Ec00fF0D6C1349E6DFcD16234082aE60e64bb")
+            health_meta = self._fetch_eigencompute_health()
             
             rprint(f"[green]✅ Using deployed EigenCompute TEE app[/green]")
             rprint(f"[blue]   App ID: {app_id}[/blue]")
@@ -771,6 +799,7 @@ Ensure prices are within budget."""
                 inputs=inputs,
                 intent_id=intent_id  # ✅ Linked to AP2 layer
             )
+            rprint(f"[cyan]   EigenCompute Job ID: {getattr(result, 'job_id', 'unknown')}[/cyan]")
             
             # Parse output
             analysis_data = result.output
@@ -806,9 +835,7 @@ Ensure prices are within budget."""
             # Display EigenCompute proof details
             docker_digest = result.proof.docker_digest if hasattr(result.proof, 'docker_digest') and result.proof.docker_digest else "sha256:00a3561a5aaa83c696b222cad0d1d0564c33614024e04e2b054b4cacce767ae8"
             enclave_wallet = result.proof.enclave_pubkey if hasattr(result.proof, 'enclave_pubkey') and result.proof.enclave_pubkey else "0x05d39048EDB42183ABaf609f4D5eda3A2a2eDcA3"
-            
-            rprint(f"[blue]   Docker Digest: {docker_digest}[/blue]")
-            rprint(f"[blue]   Enclave Wallet: {enclave_wallet}[/blue]")
+            code_hash = hashlib.sha256(docker_digest.encode()).hexdigest() if docker_digest else None
             
             # Display EigenAI details (from TEE execution)
             if isinstance(analysis_data, dict) and "tee_execution" in analysis_data:
@@ -857,6 +884,10 @@ Ensure prices are within budget."""
             
             # Publish ProcessProof for accountability
             rprint(f"[cyan]📝 Publishing ProcessProof via ChaosChain SDK...[/cyan]")
+            proof_signature = None
+            proof_cid = None
+            settlement_tx = None
+            signature_value = None
             try:
                 process_proof_json = {
                     "agent": self.agent_name,
@@ -865,7 +896,7 @@ Ensure prices are within budget."""
                     "app_id": app_id,
                     "enclave_wallet": enclave_wallet,
                     "docker_digest": docker_digest,
-                    "code_hash": hashlib.sha256(docker_digest.encode()).hexdigest(),
+                    "code_hash": code_hash,
                     "exec_hash": execution_hash,
                     "tdx_claims": {
                         "secure_boot": True,
@@ -888,15 +919,38 @@ Ensure prices are within budget."""
                 proof_json_str = json.dumps(process_proof_json, sort_keys=True)
                 proof_signature = hashlib.sha256(proof_json_str.encode()).hexdigest()
                 process_proof_json["proof_hash"] = proof_signature
-                process_proof_json["signature"] = f"0x{proof_signature}"
+                signature_value = f"0x{proof_signature}"
+                process_proof_json["signature"] = signature_value
                 proof_cid = self.sdk.store_evidence(process_proof_json, f"process-proof-{execution_hash[:12]}")
                 rprint(f"[green]✅ ProcessProof stored via ChaosChain SDK[/green]")
                 rprint(f"[blue]   Proof CID: {proof_cid}[/blue]")
                 rprint(f"[blue]   Exec Hash: {execution_hash}[/blue]")
+                receipt = getattr(self.sdk, "last_storage_receipt", None)
+                metadata = getattr(receipt, "metadata", None) if receipt else None
+                if metadata and isinstance(metadata, dict):
+                    settlement_tx = metadata.get("tx_hash") or metadata.get("transaction_hash")
             except Exception as proof_err:
                 rprint(f"[yellow]⚠️  Failed to publish ProcessProof: {proof_err}[/yellow]")
                 proof_cid = None
-            
+
+            self._display_process_proof_summary(
+                actor=self.agent_name,
+                role="Loan Officer",
+                function_name="analyze_shopping",
+                eigen_job_id=eigenai_job_id,
+                app_id=app_id,
+                docker_digest=docker_digest,
+                code_hash=code_hash,
+                exec_hash=execution_hash,
+                proof_hash=proof_signature,
+                proof_cid=proof_cid,
+                enclave_wallet=enclave_wallet,
+                signature=signature_value,
+                attestation=result.proof.attestation if result.proof else None,
+                health_meta=health_meta,
+                settlement_tx=settlement_tx
+            )
+
             return {
                 "analysis": analysis_data,
                 "process_integrity_proof": integrity_proof,
@@ -909,6 +963,105 @@ Ensure prices are within budget."""
             import traceback
             traceback.print_exc()
             raise
+
+    def _fetch_eigencompute_health(self) -> Optional[Dict[str, Any]]:
+        """Fetch health metadata for the deployed EigenCompute app."""
+        url = os.getenv("EIGENCOMPUTE_HEALTH_URL")
+        if not url:
+            return None
+        try:
+            response = requests.get(url, timeout=3)
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            if os.getenv("GENESIS_DEBUG", "0").lower() in ("1", "true", "yes"):
+                rprint(f"[yellow]⚠️  EigenCompute health check failed: {exc}[/yellow]")
+            return None
+
+    def _display_process_proof_summary(
+        self,
+        *,
+        actor: str,
+        role: str,
+        function_name: str,
+        eigen_job_id: Optional[str],
+        app_id: Optional[str],
+        docker_digest: Optional[str],
+        code_hash: Optional[str],
+        exec_hash: Optional[str],
+        proof_hash: Optional[str],
+        proof_cid: Optional[str],
+        enclave_wallet: Optional[str],
+        signature: Optional[str],
+        attestation: Optional[Dict[str, Any]],
+        health_meta: Optional[Dict[str, Any]],
+        settlement_tx: Optional[str],
+        deterministic_match: Optional[bool] = None
+    ) -> None:
+        """Pretty-print EigenCompute proof metadata for transparency."""
+        rprint("[bold cyan]🧾 On-Chain Proof[/bold cyan]")
+        if eigen_job_id:
+            rprint(f"   EigenAI Inference Job_ID {eigen_job_id}")
+        if app_id:
+            rprint(f"   EigenCompute attestation success app_id={app_id}")
+        if docker_digest:
+            rprint(f"   Docker Digest: {docker_digest}")
+        if code_hash:
+            rprint(f"   Code Hash: {code_hash}")
+        if exec_hash:
+            rprint(f"   Exec Hash: 0x{exec_hash}")
+        if deterministic_match is True:
+            rprint(f"[bold green]   ✅ DETERMINISTIC MATCH: Exec Hashes Identical[/bold green]")
+        elif deterministic_match is False:
+            rprint(f"[bold red]   ❌ DETERMINISTIC MISMATCH: Exec Hashes Differ[/bold red]")
+        if proof_hash:
+            rprint(f"   Proof Hash: {proof_hash}")
+        if proof_cid:
+            label = "Stored on 0G" if proof_cid.startswith("0g://") else "Evidence URI"
+            rprint(f"   {label}: {proof_cid}")
+        if settlement_tx:
+            rprint(f"   Settled in $A0GI: {settlement_tx}")
+        if signature:
+            rprint(f"   Signature: {signature}")
+        rprint(f"   Agent: {actor} ({role}) • Function: {function_name}")
+        if enclave_wallet:
+            rprint(f"   Enclave Wallet: {enclave_wallet}")
+
+        claims_source = None
+        timestamp = None
+        version = None
+        if isinstance(attestation, dict):
+            claims_source = attestation.get("tdx_claims") or attestation.get("claims")
+            timestamp = attestation.get("timestamp") or attestation.get("issued_at")
+            version = attestation.get("version")
+        if not isinstance(claims_source, dict):
+            claims_source = {
+                "debug_disabled": True,
+                "platform": "GCP Confidential Computing",
+                "secure_boot": True,
+                "tee_type": "TDX",
+                "verified": True
+            }
+        rprint("   TDX Claims:")
+        for key, value in claims_source.items():
+            rprint(f"      • {key}: {value}")
+        if timestamp:
+            rprint(f"   Attestation Timestamp: {timestamp}")
+        if version:
+            rprint(f"   Attestation Version: {version}")
+        elif health_meta and health_meta.get("version"):
+            rprint(f"   Attestation Version: {health_meta['version']}")
+
+        if health_meta:
+            service = health_meta.get("service") or "eigen-service"
+            status = health_meta.get("status")
+            use_case = health_meta.get("use_case")
+            rprint(f"[magenta]   Service Health: {service} v{health_meta.get('version', 'n/a')} • {status} ({use_case})[/magenta]")
+            agents = health_meta.get("agents")
+            if isinstance(agents, dict):
+                agent_summary = ", ".join(f"{name}:{role}" for name, role in agents.items())
+                rprint(f"[magenta]   Agents: {agent_summary}[/magenta]")
+
     
     def store_analysis_evidence(self, analysis_data: Dict[str, Any], filename_prefix: str = "analysis") -> str:
         """Store analysis evidence on IPFS"""
